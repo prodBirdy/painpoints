@@ -5,8 +5,26 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::LazyLock;
 
-pub const MODEL: &str = "jev-latest";
-const ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone";
+pub const DEFAULT_MODEL: &str = "jev-latest";
+pub const DEFAULT_BASE_URL: &str = "https://api.typesafe.ai";
+const SYSTEM_ONE_PATH: &str = "/v1/systemone";
+
+fn setting(name: &str, fallback: &str) -> String {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+pub fn model() -> String {
+    setting("TYPESAFE_DEFAULT_MODEL", DEFAULT_MODEL)
+}
+
+pub fn endpoint() -> String {
+    let base = setting("TYPESAFE_BASE_URL", DEFAULT_BASE_URL);
+    format!("{}{SYSTEM_ONE_PATH}", base.trim_end_matches('/'))
+}
 
 pub struct Dimension {
     pub key: &'static str,
@@ -169,6 +187,7 @@ static QUESTIONS_DIGEST: LazyLock<u64> = LazyLock::new(|| {
 pub fn digest(state: &FileState) -> String {
     let mut hasher = DefaultHasher::new();
     QUESTIONS_DIGEST.hash(&mut hasher);
+    model().hash(&mut hasher);
     state.path.hash(&mut hasher);
     state.lines.hash(&mut hasher);
     state.truncated.hash(&mut hasher);
@@ -342,25 +361,35 @@ pub fn to_record(state: &FileState, answers: &Answers) -> Record {
 pub struct Client {
     http: reqwest::Client,
     key: String,
+    model: String,
+    endpoint: String,
 }
 
 impl Client {
     pub fn new() -> Result<Self> {
-        let key = std::env::var("TYPESAFE_API_KEY").context("TYPESAFE_API_KEY is not set")?;
+        let key = std::env::var("TYPESAFE_API_KEY")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .context("TYPESAFE_API_KEY is not set; create one at https://typesafe.ai, or set TYPESAFE_BASE_URL to a gateway and pass its token as the key")?;
         let http = reqwest::Client::builder()
             .pool_max_idle_per_host(32)
             .timeout(std::time::Duration::from_secs(90))
             .build()?;
-        Ok(Self { http, key })
+        Ok(Self {
+            http,
+            key,
+            model: model(),
+            endpoint: endpoint(),
+        })
     }
 
     pub async fn classify(&self, state: &FileState) -> Result<(Record, Usage)> {
-        let body = json!({ "model": MODEL, "state": state, "questions": &*QUESTIONS });
+        let body = json!({ "model": self.model, "state": state, "questions": &*QUESTIONS });
         let mut backoff = std::time::Duration::from_millis(500);
         for attempt in 0..4 {
             let res = self
                 .http
-                .post(ENDPOINT)
+                .post(&self.endpoint)
                 .bearer_auth(&self.key)
                 .json(&body)
                 .send()
@@ -372,7 +401,12 @@ impl Client {
             }
             let retryable = status.as_u16() == 429 || status.is_server_error();
             if !retryable || attempt == 3 {
-                bail!("{} {}", status, res.text().await.unwrap_or_default());
+                bail!(
+                    "{} from {}: {}",
+                    status,
+                    self.endpoint,
+                    res.text().await.unwrap_or_default()
+                );
             }
             tokio::time::sleep(backoff).await;
             backoff *= 2;
@@ -443,6 +477,18 @@ mod tests {
         assert!(!to_record(&state(), &harmless).needs_review);
 
         assert!(to_record(&state(), &answers(0.4, [0.0; 6])).needs_review);
+    }
+
+    #[test]
+    fn the_endpoint_is_built_from_the_base_url() {
+        assert_eq!(
+            format!("{}{SYSTEM_ONE_PATH}", DEFAULT_BASE_URL.trim_end_matches('/')),
+            "https://api.typesafe.ai/v1/systemone"
+        );
+        assert_eq!(
+            format!("{}{SYSTEM_ONE_PATH}", "https://gateway.example/typesafe/".trim_end_matches('/')),
+            "https://gateway.example/typesafe/v1/systemone"
+        );
     }
 
     #[test]

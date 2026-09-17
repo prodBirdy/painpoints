@@ -1,4 +1,4 @@
-use crate::jev::{level_of, Record, DIMENSIONS, MODEL, PAIN_THRESHOLD};
+use crate::jev::{level_of, model, Record, DIMENSIONS, PAIN_THRESHOLD};
 use crate::report::{self, Report};
 use crate::run;
 use crate::scan::Config;
@@ -54,7 +54,7 @@ pub fn file_result(record: &Record, cached: bool) -> Value {
         "pain_threshold": PAIN_THRESHOLD,
         "findings": findings(record),
         "cached": cached,
-        "model": MODEL,
+        "model": model(),
     })
 }
 

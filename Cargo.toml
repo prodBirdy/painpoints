@@ -5,6 +5,9 @@ edition = "2021"
 description = "Score every source file in a repository on six architectural pain dimensions"
 license = "MIT"
 repository = "https://github.com/prodBirdy/painpoints"
+readme = "README.md"
+keywords = ["architecture", "code-quality", "ai-agents", "mcp", "static-analysis"]
+categories = ["development-tools", "command-line-utilities"]
 
 [dependencies]
 anyhow = "1"

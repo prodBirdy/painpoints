@@ -1,4 +1,4 @@
-use crate::jev::{Record, Usage, DIMENSIONS, MODEL, PAIN_THRESHOLD};
+use crate::jev::{model, Record, Usage, DIMENSIONS, PAIN_THRESHOLD};
 use anyhow::Result;
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
@@ -107,7 +107,7 @@ impl Report {
 
     pub fn json(&self) -> serde_json::Value {
         json!({
-            "model": MODEL,
+            "model": model(),
             "root": self.root.to_string_lossy(),
             "scale": "0 healthy to 3 painful, scored per file; a file is a pain point in a dimension at 2.0 or above",
             "pain_threshold": PAIN_THRESHOLD,
@@ -130,7 +130,7 @@ impl Report {
             env!("CARGO_PKG_NAME"),
             self.records.len(),
             self.root.to_string_lossy(),
-            MODEL
+            model()
         );
         let _ = writeln!(
             out,

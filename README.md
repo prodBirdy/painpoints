@@ -27,7 +27,10 @@ classifying 189 files
 ```
 
 Without `--headless` the same run opens a window for browsing and filtering the
-result.
+result. Click a file and the right panel shows, for each dimension, the exact
+level its score landed on and the standard behind it.
+
+![painpoints classifying a repository](docs/window.png)
 
 ## Install
 
@@ -35,9 +38,10 @@ result.
 cargo install --git https://github.com/prodBirdy/painpoints
 ```
 
-or clone and `cargo build --release`. Needs a [TypeSafe](https://typesafe.ai)
-API key in `TYPESAFE_API_KEY`; the judgments come from their Jev model, which
-returns typed answers and calibrated probabilities rather than prose.
+or clone and `cargo build --release`. The judgments come from
+[TypeSafe](https://typesafe.ai)'s Jev model, a System One model that returns
+typed answers and calibrated probabilities rather than prose. See
+[Jev: key, gateway, model and cost](#jev-key-gateway-model-and-cost) for setup.
 
 ```
 painpoints [TARGET] [options]
@@ -78,19 +82,67 @@ The criteria sent to the model describe those situations in plain terms, with
 no framework or vendor names, so the scores mean the same thing in a Django
 service as in a Next.js app.
 
+## Jev: key, gateway, model and cost
+
+painpoints reads the same variables as TypeSafe's own SDKs, so a setup that
+works for their Python or JavaScript client works here unchanged.
+
+| variable | default | purpose |
+| --- | --- | --- |
+| `TYPESAFE_API_KEY` | none | Bearer token sent as `Authorization: Bearer <key>` |
+| `TYPESAFE_BASE_URL` | `https://api.typesafe.ai` | Where requests go; `/v1/systemone` is appended |
+| `TYPESAFE_DEFAULT_MODEL` | `jev-latest` | Which Jev release answers |
+
+**Direct.** Create a key in your [TypeSafe](https://typesafe.ai) account and
+export it:
+
+```
+export TYPESAFE_API_KEY=<your key>
+painpoints . --headless
+```
+
+**Through a gateway.** If your organisation fronts TypeSafe with an API
+gateway (for spend limits, audit logging or a shared key), point the base URL
+at it and pass the gateway's token as the key. painpoints sends a plain
+`POST <base>/v1/systemone` with a JSON body and a bearer header, so any proxy
+that forwards that shape works:
+
+```
+export TYPESAFE_BASE_URL=https://ai-gateway.example.com/typesafe
+export TYPESAFE_API_KEY=<gateway token>
+```
+
+**Pinning the model.** `jev-latest` moves when TypeSafe ships a new release.
+The cache digest includes the model name, so a rerun after the alias moves
+reclassifies everything. If you have tuned what counts as a pain point against
+one release, pin it:
+
+```
+export TYPESAFE_DEFAULT_MODEL=jev-1.13.0
+```
+
+**Cost.** Each file is one request of roughly 4 to 5 thousand input tokens
+(the first 8000 characters of the file plus the question set); output tokens
+are free. At TypeSafe's published rate of $0.042 per million input tokens the
+189-file repository in the screenshot cost about three cents to classify once,
+and nothing to reopen.
+
 ## Saved results
 
 The JSON report is also the cache. Every record carries a `digest` over the
-question set and the exact state sent for that file, so a rerun only calls the
-API for files whose digest changed: edit three files in a 300 file repo and the
-next run costs three requests. `--refresh` reclassifies everything, and
-changing a question invalidates every digest by itself. With nothing to
-reclassify the run needs no API key at all, so reopening the window to browse
-the last result is free.
+question set, the model name and the exact state sent for that file, so a rerun
+only calls the API for files whose digest changed: edit three files in a 300
+file repo and the next run costs three requests. `--refresh` reclassifies
+everything, and changing a question invalidates every digest by itself. With
+nothing to reclassify the run needs no API key at all, so reopening the window
+to browse the last result is free.
 
 ## For agents
 
-Three ways in, all sharing one cache.
+Three ways in, all sharing one cache. The repository also ships a Claude Code
+skill at `.claude/skills/painpoints/SKILL.md` that tells an agent when to reach
+for the tool, which entry point to pick, and how to read a result without
+over-claiming.
 
 **One file, atomic.** Point it at a single file and get that file's result on
 stdout. Nothing else is read, nothing else is written.
@@ -143,7 +195,7 @@ stdio with two tools:
     "painpoints": {
       "command": "painpoints",
       "args": ["mcp"],
-      "env": { "TYPESAFE_API_KEY": "sk-..." }
+      "env": { "TYPESAFE_API_KEY": "<your key>" }
     }
   }
 }

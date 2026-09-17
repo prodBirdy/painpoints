@@ -20,7 +20,18 @@ const WARN: u32 = 0xff9f0a;
 const DANGER: u32 = 0xff453a;
 const OK: u32 = 0x30d158;
 
+#[cfg(target_os = "windows")]
+const FONT: &str = "Segoe UI";
+#[cfg(target_os = "windows")]
 const MONO: &str = "Consolas";
+#[cfg(target_os = "macos")]
+const FONT: &str = ".SystemUIFont";
+#[cfg(target_os = "macos")]
+const MONO: &str = "Menlo";
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+const FONT: &str = "DejaVu Sans";
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+const MONO: &str = "DejaVu Sans Mono";
 
 const ROW_HEIGHT: f32 = 28.0;
 const W_PAIN: f32 = 40.0;
@@ -341,17 +352,17 @@ impl PainPoints {
                     )
                     .child(div().flex_grow())
                     .when(!self.finished, |el| {
-                        el.child(stat("classified", format!("{done} / {}", self.total)))
+                        el.child(stat("CLASSIFIED", format!("{done} / {}", self.total)))
                     })
                     .when(self.finished, |el| {
-                        el.child(stat("files", self.records.len().to_string()))
+                        el.child(stat("FILES", self.records.len().to_string()))
                     })
                     .when(!self.failures.is_empty(), |el| {
-                        el.child(stat("failed", self.failures.len().to_string()))
+                        el.child(stat("FAILED", self.failures.len().to_string()))
                     })
                     .when(spent, |el| {
                         el.child(stat(
-                            "tokens",
+                            "TOKENS",
                             format!("{} in / {} out", self.usage.input_tokens, self.usage.output_tokens),
                         ))
                     })
@@ -671,7 +682,7 @@ impl PainPoints {
                             .text_color(rgb(MUTED))
                             .child(dimension.levels[level_of(score)]),
                     )
-                    .child(label(dimension.url)),
+                    .child(label(dimension.source)),
             );
         }
 
@@ -686,6 +697,7 @@ fn row(index: usize, record: &Record, selected: bool) -> Stateful<Div> {
     }
 
     let content = div()
+        .w_full()
         .flex_grow()
         .flex()
         .items_center()
@@ -699,7 +711,10 @@ fn row(index: usize, record: &Record, selected: bool) -> Stateful<Div> {
         .child(
             div()
                 .flex_grow()
+                .min_w_0()
                 .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
                 .text_size(px(12.))
                 .text_color(rgb(TEXT))
                 .child(SharedString::from(record.path.clone())),
@@ -727,6 +742,7 @@ fn row(index: usize, record: &Record, selected: bool) -> Stateful<Div> {
 
     div()
         .id(("row", index))
+        .w_full()
         .h(px(ROW_HEIGHT))
         .flex()
         .flex_col()
@@ -753,7 +769,7 @@ impl Render for PainPoints {
             .flex_col()
             .bg(rgb(BG))
             .text_color(rgb(TEXT))
-            .font_family("Segoe UI")
+            .font_family(FONT)
             .child(self.header())
             .child(
                 div()
