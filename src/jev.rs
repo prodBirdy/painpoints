@@ -224,13 +224,23 @@ struct SystemOneResult {
     usage: Usage,
 }
 
+fn round2<S: serde::Serializer>(value: &f32, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_f64(((*value as f64) * 100.0).round() / 100.0)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Scores {
+    #[serde(serialize_with = "round2")]
     pub boundary_leak: f32,
+    #[serde(serialize_with = "round2")]
     pub complexity: f32,
+    #[serde(serialize_with = "round2")]
     pub data_access_cost: f32,
+    #[serde(serialize_with = "round2")]
     pub failure_handling: f32,
+    #[serde(serialize_with = "round2")]
     pub interaction_cost: f32,
+    #[serde(serialize_with = "round2")]
     pub trust_boundary_risk: f32,
 }
 
@@ -260,10 +270,13 @@ pub struct Record {
     pub path: String,
     pub lines: usize,
     pub role: String,
+    #[serde(serialize_with = "round2")]
     pub role_confidence: f32,
     pub scores: Scores,
     pub worst_dimension: String,
+    #[serde(serialize_with = "round2")]
     pub worst_score: f32,
+    #[serde(serialize_with = "round2")]
     pub total_score: f32,
     pub needs_review: bool,
     pub digest: String,

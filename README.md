@@ -40,14 +40,19 @@ API key in `TYPESAFE_API_KEY`; the judgments come from their Jev model, which
 returns typed answers and calibrated probabilities rather than prose.
 
 ```
-painpoints [ROOT] [options]
+painpoints [TARGET] [options]
+painpoints mcp
 
-  ROOT              repository to classify (default: PAINPOINTS_ROOT or the current directory)
-  --include DIR     only walk this subdirectory, repeatable (default: the whole repository)
+  TARGET            a repository to classify, or a single source file
+                    (default: PAINPOINTS_ROOT or the current directory)
+  --include DIR     only walk this subdirectory, repeatable
   --limit N         stop after N files
   --out DIR         where the report is written (default: ROOT/.painpoints)
   --headless        write the report without opening a window
+  --json            print the result to stdout as JSON
   --refresh         reclassify everything instead of reusing the saved report
+
+  mcp               serve the Model Context Protocol on stdio
 ```
 
 It walks any language it recognises (TypeScript, JavaScript, Python, Go, Rust,
@@ -85,10 +90,64 @@ the last result is free.
 
 ## For agents
 
-Read `.painpoints/architecture-pain.json`. `summary.by_dimension` says which
-kind of pain this repo has; `files` is ranked worst first and carries
-`worst_dimension`, `worst_score` and every individual score; each entry in
-`dimensions` carries the `url` of the standard it was judged against.
+Three ways in, all sharing one cache.
+
+**One file, atomic.** Point it at a single file and get that file's result on
+stdout. Nothing else is read, nothing else is written.
+
+```
+$ painpoints src/routes/admin.ts --json
+{
+  "path": "src/routes/admin.ts",
+  "role": "api-surface",
+  "scores": { "boundary_leak": 2.8, "complexity": 1.4, "data_access_cost": 1.1,
+              "failure_handling": 1.1, "interaction_cost": 0.0, "trust_boundary_risk": 2.1 },
+  "worst_dimension": "boundary_leak",
+  "worst_score": 2.8,
+  "is_pain_point": true,
+  "findings": [
+    {
+      "dimension": "boundary_leak",
+      "score": 2.8,
+      "level": 3,
+      "description": "Transport, business rules, persistence and presentation are interleaved in one file, or it duplicates a rule that is also defined elsewhere so the copies will drift.",
+      "source": "Google Engineering Practices, What to look for in a code review",
+      "url": "https://google.github.io/eng-practices/review/reviewer/looking-for.html"
+    }
+  ],
+  "cached": false,
+  "tokens": { "input_tokens": 4446, "output_tokens": 175 }
+}
+```
+
+`findings` is the part worth acting on: one entry per dimension at 2.0 or
+above, carrying the level the score landed on, its description, and the
+published standard behind it. A healthy file returns an empty `findings` array,
+which is a real answer rather than a shrug.
+
+**The whole codebase.** `painpoints . --json` returns the same shape as the
+saved report: `summary.by_dimension` for the distribution, `files` ranked worst
+first, `dimensions` with a `url` each.
+
+**As a tool call.** `painpoints mcp` serves the Model Context Protocol on
+stdio with two tools:
+
+| tool | arguments | returns |
+| --- | --- | --- |
+| `painpoints_file` | `path`, `refresh?` | the atomic result above |
+| `painpoints_repo` | `root?`, `include?`, `limit?`, `top?`, `refresh?` | distribution, the worst `top` files with their findings, and where the report was written |
+
+```json
+{
+  "mcpServers": {
+    "painpoints": {
+      "command": "painpoints",
+      "args": ["mcp"],
+      "env": { "TYPESAFE_API_KEY": "sk-..." }
+    }
+  }
+}
+```
 
 Scores are model judgments over the first 8000 characters of a file. They are a
 reading order, not evidence. Anything flagged `needs_review` is where the model

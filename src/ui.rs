@@ -3,22 +3,22 @@ use crate::report::Report;
 use crate::scan::Event;
 use gpui::{
     div, prelude::*, px, relative, rgb, rgba, uniform_list, AnyElement, AsyncApp, Context, Div,
-    Entity, Rgba, SharedString, Stateful, Window,
+    Entity, FontWeight, Rgba, SharedString, Stateful, Window,
 };
 use std::path::PathBuf;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-const BG: u32 = 0x0f1017;
-const PANEL: u32 = 0x15161f;
-const RAISED: u32 = 0x1c1e2a;
-const LINE: u32 = 0x24273a;
-const TEXT: u32 = 0xd7dae5;
-const MUTED: u32 = 0x6f7487;
-const FAINT: u32 = 0x4c5066;
-const ACCENT: u32 = 0x7aa2f7;
-const WARN: u32 = 0xe0af68;
-const DANGER: u32 = 0xf7768e;
-const OK: u32 = 0x9ece6a;
+const BG: u32 = 0x1c1c1e;
+const PANEL: u32 = 0x2c2c2e;
+const RAISED: u32 = 0x3a3a3c;
+const LINE: u32 = 0x38383a;
+const TEXT: u32 = 0xf2f2f7;
+const MUTED: u32 = 0x98989f;
+const FAINT: u32 = 0x636366;
+const ACCENT: u32 = 0x0a84ff;
+const WARN: u32 = 0xff9f0a;
+const DANGER: u32 = 0xff453a;
+const OK: u32 = 0x30d158;
 
 const MONO: &str = "Consolas";
 
@@ -211,8 +211,8 @@ fn badge(text: impl Into<SharedString>, color: u32) -> impl IntoElement {
     div()
         .px(px(6.))
         .py(px(2.))
-        .rounded(px(4.))
-        .bg(tint(color, 0x1f))
+        .rounded(px(6.))
+        .bg(tint(color, 0x24))
         .text_color(rgb(color))
         .text_size(px(11.))
         .child(text.into())
@@ -239,8 +239,8 @@ fn heat(score: f32) -> impl IntoElement {
         .flex()
         .items_center()
         .justify_center()
-        .rounded(px(4.))
-        .when(score >= 1.0, |el| el.bg(tint(color, 0x1c)))
+        .rounded(px(6.))
+        .when(score >= 1.0, |el| el.bg(tint(color, 0x24)))
         .font_family(MONO)
         .text_size(px(11.))
         .text_color(rgb(color))
@@ -325,6 +325,7 @@ impl PainPoints {
                             .child(
                                 div()
                                     .text_size(px(16.))
+                                    .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(rgb(TEXT))
                                     .child("architecture pain points"),
                             )
@@ -383,7 +384,7 @@ impl PainPoints {
             .pl(px(8.))
             .pr(px(8.))
             .py(px(6.))
-            .rounded(px(6.))
+            .rounded(px(8.))
             .cursor_pointer()
             .when(selected, |el| el.bg(rgb(RAISED)))
             .hover(|el| el.bg(rgb(LINE)))
@@ -621,8 +622,8 @@ impl PainPoints {
                     .flex()
                     .flex_col()
                     .gap(px(6.))
-                    .p(px(10.))
-                    .rounded(px(8.))
+                    .p(px(12.))
+                    .rounded(px(10.))
                     .bg(rgb(RAISED))
                     .child(
                         div()
@@ -659,19 +660,11 @@ fn row(index: usize, record: &Record, selected: bool) -> Stateful<Div> {
         cells = cells.child(heat(value));
     }
 
-    div()
-        .id(("row", index))
-        .h(px(ROW_HEIGHT))
+    let content = div()
+        .flex_grow()
         .flex()
         .items_center()
         .gap(px(COL_GAP))
-        .cursor_pointer()
-        .pr(px(GUTTER))
-        .pl(px(GUTTER - 2.))
-        .border_l(px(2.))
-        .border_color(if selected { rgb(ACCENT) } else { rgba(0) })
-        .when(selected, |el| el.bg(rgb(RAISED)))
-        .hover(|el| el.bg(rgb(PANEL)))
         .child(number(
             format!("{:.1}", record.worst_score),
             W_PAIN,
@@ -705,7 +698,22 @@ fn row(index: usize, record: &Record, selected: bool) -> Stateful<Div> {
             W_CONF,
             if record.needs_review { WARN } else { FAINT },
             11.,
-        ))
+        ));
+
+    div()
+        .id(("row", index))
+        .h(px(ROW_HEIGHT))
+        .flex()
+        .flex_col()
+        .cursor_pointer()
+        .pr(px(GUTTER))
+        .pl(px(GUTTER - 2.))
+        .border_l(px(2.))
+        .border_color(if selected { rgb(ACCENT) } else { rgba(0) })
+        .when(selected, |el| el.bg(rgb(RAISED)))
+        .hover(|el| el.bg(rgb(PANEL)))
+        .child(content)
+        .child(div().h(px(1.)).w_full().flex_none().bg(tint(LINE, 0x80)))
 }
 
 impl Render for PainPoints {

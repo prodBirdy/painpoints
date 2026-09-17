@@ -29,8 +29,39 @@ pub struct Report {
     pub root: PathBuf,
 }
 
+pub fn dimensions_meta() -> serde_json::Value {
+    json!(DIMENSIONS
+        .iter()
+        .map(|d| json!({
+            "key": d.key,
+            "label": d.label,
+            "source": d.source,
+            "url": d.url,
+        }))
+        .collect::<Vec<_>>())
+}
+
+pub fn merge_write(
+    dir: &Path,
+    root: &Path,
+    fresh: &[Record],
+    usage: Usage,
+) -> Result<(PathBuf, PathBuf)> {
+    let mut kept = load(dir);
+    for record in fresh {
+        kept.insert(record.path.clone(), record.clone());
+    }
+    let report = Report {
+        records: kept.into_values().collect(),
+        failures: Vec::new(),
+        usage,
+        root: root.to_path_buf(),
+    };
+    report.write(dir)
+}
+
 impl Report {
-    fn ranked(&self) -> Vec<&Record> {
+    pub fn ranked(&self) -> Vec<&Record> {
         let mut sorted: Vec<&Record> = self.records.iter().collect();
         sorted.sort_by(|a, b| a.rank_key().cmp(&b.rank_key()));
         sorted
@@ -51,7 +82,7 @@ impl Report {
         counts
     }
 
-    fn json(&self) -> serde_json::Value {
+    pub fn summary(&self) -> serde_json::Value {
         let by_dimension: BTreeMap<&str, usize> = DIMENSIONS
             .iter()
             .map(|d| {
@@ -65,23 +96,23 @@ impl Report {
             .collect();
 
         json!({
+            "files_classified": self.records.len(),
+            "pain_points": self.pain_points(),
+            "needs_review": self.records.iter().filter(|r| r.needs_review).count(),
+            "by_dimension": by_dimension,
+            "by_role": self.tally(|r| r.role.as_str()),
+            "usage": self.usage,
+        })
+    }
+
+    pub fn json(&self) -> serde_json::Value {
+        json!({
             "model": MODEL,
             "root": self.root.to_string_lossy(),
             "scale": "0 healthy to 3 painful, scored per file; a file is a pain point in a dimension at 2.0 or above",
-            "dimensions": DIMENSIONS.iter().map(|d| json!({
-                "key": d.key,
-                "label": d.label,
-                "source": d.source,
-                "url": d.url,
-            })).collect::<Vec<_>>(),
-            "summary": {
-                "files_classified": self.records.len(),
-                "pain_points": self.pain_points(),
-                "needs_review": self.records.iter().filter(|r| r.needs_review).count(),
-                "by_dimension": by_dimension,
-                "by_role": self.tally(|r| r.role.as_str()),
-                "usage": self.usage,
-            },
+            "pain_threshold": PAIN_THRESHOLD,
+            "dimensions": dimensions_meta(),
+            "summary": self.summary(),
             "files": self.ranked(),
             "failures": self.failures.iter().map(|(path, error)| json!({
                 "path": path,

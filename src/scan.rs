@@ -61,6 +61,7 @@ const SKIP_SUFFIXES: [&str; 5] = [".d.ts", ".min.js", ".min.mjs", ".bundle.js", 
 pub struct Config {
     pub root: PathBuf,
     pub includes: Vec<String>,
+    pub only: Option<PathBuf>,
     pub limit: usize,
 }
 
@@ -69,9 +70,37 @@ impl Config {
         Self {
             root,
             includes: Vec::new(),
+            only: None,
             limit: 0,
         }
     }
+
+    pub fn single(file: PathBuf) -> Self {
+        let mut config = Self::new(repo_root_of(&file));
+        config.only = Some(file);
+        config
+    }
+}
+
+pub fn absolute(path: PathBuf) -> PathBuf {
+    match path.canonicalize() {
+        Ok(full) => match full.to_str().and_then(|p| p.strip_prefix(r"\\?\")) {
+            Some(stripped) => PathBuf::from(stripped),
+            None => full,
+        },
+        Err(_) => path,
+    }
+}
+
+pub fn repo_root_of(file: &Path) -> PathBuf {
+    let mut current = file.parent();
+    while let Some(dir) = current {
+        if dir.join(".git").exists() {
+            return dir.to_path_buf();
+        }
+        current = dir.parent();
+    }
+    file.parent().unwrap_or(Path::new(".")).to_path_buf()
 }
 
 pub fn default_root() -> PathBuf {
@@ -91,6 +120,12 @@ pub fn language(path: &Path) -> Option<&'static str> {
 }
 
 pub fn collect_files(config: &Config) -> Vec<PathBuf> {
+    if let Some(file) = &config.only {
+        return match file.is_file() && language(file).is_some() {
+            true => vec![file.clone()],
+            false => Vec::new(),
+        };
+    }
     let dirs: Vec<PathBuf> = if config.includes.is_empty() {
         vec![config.root.clone()]
     } else {
