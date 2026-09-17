@@ -1,4 +1,4 @@
-use crate::jev::{level_of, Record, Usage, DIMENSIONS, MODEL, PAIN_THRESHOLD};
+use crate::jev::{level_of, Record, Usage, DIMENSIONS, PAIN_THRESHOLD};
 use crate::report::Report;
 use crate::scan::Event;
 use gpui::{
@@ -303,6 +303,14 @@ impl PainPoints {
         } else {
             done as f32 / self.total as f32
         };
+        let pain = self.pain_points();
+        let spent = self.usage.input_tokens > 0;
+        let name = self
+            .root
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| self.root.to_string_lossy().to_string());
+
         div()
             .flex()
             .flex_col()
@@ -315,55 +323,55 @@ impl PainPoints {
             .child(
                 div()
                     .flex()
-                    .items_center()
+                    .items_end()
                     .gap(px(28.))
                     .child(
                         div()
                             .flex()
                             .flex_col()
                             .gap(px(2.))
+                            .child(label("ARCHITECTURE PAIN POINTS"))
                             .child(
                                 div()
                                     .text_size(px(16.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(rgb(TEXT))
-                                    .child("architecture pain points"),
-                            )
-                            .child(label(SharedString::from(
-                                self.root.to_string_lossy().to_string(),
-                            ))),
+                                    .child(SharedString::from(name)),
+                            ),
                     )
                     .child(div().flex_grow())
-                    .child(stat("files", format!("{done} / {}", self.total)))
-                    .child(stat("pain points", self.pain_points().to_string()))
-                    .child(stat("reused", self.cached.to_string()))
-                    .child(stat(
-                        "tokens in / out",
-                        format!("{} / {}", self.usage.input_tokens, self.usage.output_tokens),
-                    ))
-                    .child(stat("failed", self.failures.len().to_string()))
-                    .child(badge(MODEL, ACCENT)),
+                    .when(!self.finished, |el| {
+                        el.child(stat("classified", format!("{done} / {}", self.total)))
+                    })
+                    .when(self.finished, |el| {
+                        el.child(stat("files", self.records.len().to_string()))
+                    })
+                    .when(!self.failures.is_empty(), |el| {
+                        el.child(stat("failed", self.failures.len().to_string()))
+                    })
+                    .when(spent, |el| {
+                        el.child(stat(
+                            "tokens",
+                            format!("{} in / {} out", self.usage.input_tokens, self.usage.output_tokens),
+                        ))
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(label("PAIN POINTS"))
+                            .child(
+                                div()
+                                    .font_family(MONO)
+                                    .text_size(px(20.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(if pain > 0 { DANGER } else { OK }))
+                                    .child(pain.to_string()),
+                            ),
+                    ),
             )
-            .when(!self.finished, |el| {
-                el.child(meter(fraction, ACCENT, 2.))
-            })
-            .when_some(self.written.clone(), |el, path| {
-                el.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(6.))
-                        .child(
-                            div()
-                                .w(px(5.))
-                                .h(px(5.))
-                                .rounded(px(3.))
-                                .bg(rgb(OK))
-                                .flex_none(),
-                        )
-                        .child(label(SharedString::from(path))),
-                )
-            })
+            .when(!self.finished, |el| el.child(meter(fraction, ACCENT, 2.)))
     }
 
     fn filter_button(
@@ -479,7 +487,7 @@ impl PainPoints {
 
 impl PainPoints {
     fn column_header(&self) -> impl IntoElement {
-        let mut header = div()
+        let header = div()
             .h(px(26.))
             .flex()
             .items_center()
@@ -573,6 +581,23 @@ impl PainPoints {
                         .text_color(rgb(MUTED))
                         .child("Select a file to see which level each score landed on."),
                 )
+                .when_some(self.written.clone(), |el, path| {
+                    el.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(
+                                div()
+                                    .w(px(5.))
+                                    .h(px(5.))
+                                    .flex_none()
+                                    .rounded(px(3.))
+                                    .bg(rgb(OK)),
+                            )
+                            .child(label(SharedString::from(path))),
+                    )
+                })
                 .into_any_element();
         };
 
