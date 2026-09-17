@@ -1,8 +1,19 @@
 # painpoints
 
+**Find the architectural pain points in any codebase.** A CLI, an MCP server
+and a native viewer that score every source file on layering, complexity, data
+access cost, failure handling, UI cost and trust-boundary risk, then hand AI
+coding agents a ranked, self-explaining report of the technical debt worth
+fixing first.
+
+[![MIT licence](https://img.shields.io/badge/licence-MIT-blue)](LICENSE)
+[![Latest release](https://img.shields.io/github/v/release/prodBirdy/painpoints)](https://github.com/prodBirdy/painpoints/releases)
+[![Rust](https://img.shields.io/badge/built%20with-Rust%20%2B%20GPUI-orange)](Cargo.toml)
+
 Point it at a repository. It scores every source file on six architectural pain
 dimensions and writes a ranked report an AI coding agent can read before it
-touches anything.
+touches anything. Works with Claude Code, Cursor, Codex and anything else that
+speaks the Model Context Protocol or can run a command.
 
 The dimensions are not invented. Each one's levels describe situations that
 Google, Amazon and OWASP have published warnings about, so a finding can be
@@ -205,6 +216,14 @@ Scores are model judgments over the first 8000 characters of a file. They are a
 reading order, not evidence. Anything flagged `needs_review` is where the model
 itself was unsure, and a file whose interesting code starts past 8000
 characters is judged on what came before it.
+
+## Related
+
+painpoints sits between a linter and an architecture review. Linters and
+SonarQube-style analysers catch rule violations line by line; this asks the
+six questions a senior reviewer asks about a whole file and answers them
+against published standards, in a shape an agent can act on. It does not
+replace tests, a type checker or a security scanner.
 
 ## Licence
 
