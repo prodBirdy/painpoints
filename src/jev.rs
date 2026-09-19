@@ -1,3 +1,4 @@
+use crate::rubric::{self, RuleVerdict, Rubric};
 use anyhow::{bail, Context as _, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -184,7 +185,7 @@ static QUESTIONS_DIGEST: LazyLock<u64> = LazyLock::new(|| {
     hasher.finish()
 });
 
-pub fn digest(state: &FileState) -> String {
+pub fn digest(state: &FileState, rubric: Option<&Rubric>) -> String {
     let mut hasher = DefaultHasher::new();
     QUESTIONS_DIGEST.hash(&mut hasher);
     model().hash(&mut hasher);
@@ -192,7 +193,20 @@ pub fn digest(state: &FileState) -> String {
     state.lines.hash(&mut hasher);
     state.truncated.hash(&mut hasher);
     state.source.hash(&mut hasher);
+    if let Some(applied) = rubric
+        .map(|r| r.applied_digest(&state.path))
+        .filter(|d| !d.is_empty())
+    {
+        applied.hash(&mut hasher);
+    }
     format!("{:016x}", hasher.finish())
+}
+
+pub fn questions_for(state: &FileState, rubric: Option<&Rubric>) -> Value {
+    let Some(rubric) = rubric else {
+        return QUESTIONS.clone();
+    };
+    rubric::questions_for_rules(QUESTIONS.clone(), &rubric.model_rules_for(&state.path))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -234,13 +248,6 @@ pub struct Usage {
     pub input_tokens: u64,
     #[serde(default)]
     pub output_tokens: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct SystemOneResult {
-    answers: Answers,
-    #[serde(default)]
-    usage: Usage,
 }
 
 fn round2<S: serde::Serializer>(value: &f32, serializer: S) -> Result<S::Ok, S::Error> {
@@ -299,6 +306,8 @@ pub struct Record {
     pub total_score: f32,
     pub needs_review: bool,
     pub digest: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rule_verdicts: Vec<RuleVerdict>,
 }
 
 impl Record {
@@ -308,6 +317,10 @@ impl Record {
             -(self.total_score * 1000.0) as i32,
             self.path.as_str(),
         )
+    }
+
+    pub fn has_rule_violation(&self) -> bool {
+        self.rule_verdicts.iter().any(|v| v.band == "act")
     }
 }
 
@@ -353,8 +366,9 @@ pub fn to_record(state: &FileState, answers: &Answers) -> Record {
         worst_score: worst.1,
         total_score: values.iter().sum(),
         needs_review: answers.role.confidence < 0.6 || shaky_score,
-        digest: digest(state),
+        digest: digest(state, None),
         scores,
+        rule_verdicts: Vec::new(),
     }
 }
 
@@ -383,8 +397,9 @@ impl Client {
         })
     }
 
-    pub async fn classify(&self, state: &FileState) -> Result<(Record, Usage)> {
-        let body = json!({ "model": self.model, "state": state, "questions": &*QUESTIONS });
+    pub async fn classify(&self, state: &FileState, rubric: Option<&Rubric>) -> Result<(Record, Usage)> {
+        let questions = questions_for(state, rubric);
+        let body = json!({ "model": self.model, "state": state, "questions": questions });
         let mut backoff = std::time::Duration::from_millis(500);
         for attempt in 0..4 {
             let res = self
@@ -396,8 +411,27 @@ impl Client {
                 .await?;
             let status = res.status();
             if status.is_success() {
-                let parsed: SystemOneResult = res.json().await?;
-                return Ok((to_record(state, &parsed.answers), parsed.usage));
+                let parsed: Value = res.json().await?;
+                let answers: Answers = serde_json::from_value(parsed["answers"].clone())
+                    .context("SystemOne answers")?;
+                let usage: Usage = parsed
+                    .get("usage")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+                let mut record = to_record(state, &answers);
+                record.digest = digest(state, rubric);
+                if let Some(rubric) = rubric {
+                    let rules = rubric.model_rules_for(&state.path);
+                    record.rule_verdicts = rubric::verdicts_from_answers(
+                        &parsed["answers"],
+                        &rules,
+                        rubric.thresholds(),
+                    );
+                    if record.rule_verdicts.iter().any(|v| v.band == "flag") {
+                        record.needs_review = true;
+                    }
+                }
+                return Ok((record, usage));
             }
             let retryable = status.as_u16() == 429 || status.is_server_error();
             if !retryable || attempt == 3 {
@@ -503,5 +537,105 @@ mod tests {
             assert_eq!(question["criteria"].as_array().unwrap().len(), 4);
             assert!(dimension.url.starts_with("https://"));
         }
+        assert_eq!(DIMENSIONS.len(), 6);
+        assert!(!keys.contains_key("agent_rule_compliance"));
+    }
+
+    fn model_rule(id: &str, scope: Option<Vec<String>>) -> rubric::Rule {
+        rubric::Rule {
+            id: id.into(),
+            text: "Never show a user a raw error".into(),
+            source: rubric::RuleSource {
+                path: "AGENTS.md".into(),
+                line: Some(4),
+            },
+            scope,
+            when: Some("edit".into()),
+            check: rubric::Check::Model {
+                question: rubric::Question::Boolean {
+                    instructions: "Does this file put raw exception text where a user will see it?".into(),
+                    criteria: None,
+                },
+                overlaps: None,
+            },
+            status: "active".into(),
+        }
+    }
+
+    fn sample_rubric(rules: Vec<rubric::Rule>) -> Rubric {
+        Rubric {
+            version: 1,
+            compiled_at: "2026-09-19T00:00:00Z".into(),
+            compiled_by: Some("painpoints".into()),
+            sources: vec![],
+            thresholds: None,
+            rules,
+        }
+    }
+
+    #[test]
+    fn questions_include_matching_model_rules_only() {
+        let rubric = sample_rubric(vec![model_rule(
+            "no-raw-error",
+            Some(vec!["server/**/*.ts".into()]),
+        )]);
+        let mut file = state();
+        file.path = "server/src/routes/fm.ts".into();
+        let with_rules = questions_for(&file, Some(&rubric));
+        assert!(with_rules.get("rule:no-raw-error").is_some());
+        assert_eq!(with_rules["rule:no-raw-error"]["type"], "boolean");
+        for dimension in DIMENSIONS {
+            assert_eq!(with_rules[dimension.key]["type"], "score");
+        }
+
+        file.path = "client/src/App.tsx".into();
+        let without = questions_for(&file, Some(&rubric));
+        assert!(without.get("rule:no-raw-error").is_none());
+        assert_eq!(without, *QUESTIONS);
+        assert_eq!(questions_for(&file, None), *QUESTIONS);
+    }
+
+    #[test]
+    fn digest_is_stable_without_rules_and_moves_when_they_change() {
+        let file = state();
+        let empty = digest(&file, None);
+        let unused = sample_rubric(vec![model_rule(
+            "no-raw-error",
+            Some(vec!["apps/web/**/*".into()]),
+        )]);
+        assert_eq!(digest(&file, Some(&unused)), empty);
+
+        let matching = sample_rubric(vec![model_rule("no-raw-error", None)]);
+        let first = digest(&file, Some(&matching));
+        assert_ne!(first, empty);
+        let changed = sample_rubric(vec![model_rule("use-yup", None)]);
+        assert_ne!(digest(&file, Some(&changed)), first);
+    }
+
+    #[test]
+    fn old_record_json_without_rule_verdicts_deserializes() {
+        let json = r#"{
+            "path": "server/db.ts",
+            "lines": 10,
+            "role": "data-access",
+            "role_confidence": 0.9,
+            "scores": {
+                "boundary_leak": 0.4,
+                "complexity": 1.1,
+                "data_access_cost": 2.7,
+                "failure_handling": 1.0,
+                "interaction_cost": 0.0,
+                "trust_boundary_risk": 0.3
+            },
+            "worst_dimension": "data_access_cost",
+            "worst_score": 2.7,
+            "total_score": 5.5,
+            "needs_review": false,
+            "digest": "cafe"
+        }"#;
+        let record: Record = serde_json::from_str(json).unwrap();
+        assert!(record.rule_verdicts.is_empty());
+        assert_eq!(record.scores.data_access_cost, 2.7);
+        assert!(!record.has_rule_violation());
     }
 }

@@ -1,6 +1,7 @@
 mod jev;
 mod mcp;
 mod report;
+mod rubric;
 mod run;
 mod scan;
 mod ui;
@@ -12,6 +13,7 @@ use std::path::PathBuf;
 
 const USAGE: &str = "\
 painpoints [TARGET] [options]
+painpoints compile [TARGET]
 painpoints mcp
 
   TARGET            a repository to classify, or a single source file
@@ -24,10 +26,12 @@ painpoints mcp
   --refresh         reclassify everything instead of reusing the saved report
   -h, --help        this text
 
+  compile           discover AGENTS.md and friends, write .painpoints/rubric.json
+  --draft           after compile, print how to hand-edit model questions
   mcp               serve the Model Context Protocol on stdio, exposing
                     painpoints_file and painpoints_repo
 
-Needs TYPESAFE_API_KEY in the environment.";
+Needs TYPESAFE_API_KEY in the environment to classify. compile does not.";
 
 #[derive(PartialEq)]
 enum Mode {
@@ -41,6 +45,56 @@ struct Args {
     out: Option<PathBuf>,
     mode: Mode,
     refresh: bool,
+}
+
+fn compile_cmd() -> Result<()> {
+    let mut target: Option<PathBuf> = None;
+    let mut out = None;
+    let mut draft = false;
+    let mut args = std::env::args().skip(2);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                return Ok(());
+            }
+            "--draft" => draft = true,
+            "--out" => match args.next() {
+                Some(value) => out = Some(PathBuf::from(value)),
+                None => bail!("--out needs a directory"),
+            },
+            other if other.starts_with('-') => bail!("unknown option {other}"),
+            other if target.is_none() => target = Some(PathBuf::from(other)),
+            other => bail!("unexpected argument {other}"),
+        }
+    }
+
+    let root = scan::absolute(target.unwrap_or_else(scan::default_root));
+    if !root.is_dir() {
+        bail!("{} is not a directory", root.display());
+    }
+    let dest = out
+        .unwrap_or_else(|| root.join(".painpoints"))
+        .join(rubric::RUBRIC_FILE);
+    let candidates = rubric::discover(&root);
+    if candidates.is_empty() {
+        eprintln!("found 0 instruction files under {}", root.display());
+        return Ok(());
+    }
+    let compiled = rubric::compile(&root, &candidates);
+    rubric::write(&dest, &compiled)?;
+    let (model, lint, deferred, unenforceable) = compiled.bucket_counts();
+    eprintln!(
+        "compiled {} rules from {} files → {}",
+        compiled.rules.len(),
+        compiled.sources.len(),
+        dest.display()
+    );
+    eprintln!("  {model} model, {lint} lint, {deferred} deferred, {unenforceable} unenforceable");
+    if draft {
+        println!("{}", rubric::draft_notes(&compiled, &dest));
+    }
+    Ok(())
 }
 
 fn parse() -> Result<Option<Args>> {
@@ -140,7 +194,7 @@ fn headless(args: Args) -> Result<()> {
         report
             .records
             .iter()
-            .filter(|r| r.worst_score >= jev::PAIN_THRESHOLD)
+            .filter(|r| r.worst_score >= jev::PAIN_THRESHOLD || r.has_rule_violation())
             .count(),
         report.usage.input_tokens,
         report.usage.output_tokens
@@ -175,8 +229,10 @@ fn emit_json(args: Args) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("mcp") {
-        return mcp::serve();
+    match std::env::args().nth(1).as_deref() {
+        Some("mcp") => return mcp::serve(),
+        Some("compile") => return compile_cmd(),
+        _ => {}
     }
 
     let Some(args) = parse()? else {

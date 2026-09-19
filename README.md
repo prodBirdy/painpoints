@@ -67,6 +67,7 @@ painpoints mcp
   --json            print the result to stdout as JSON
   --refresh         reclassify everything instead of reusing the saved report
 
+  compile [TARGET]  discover AGENTS.md and friends, write .painpoints/rubric.json
   mcp               serve the Model Context Protocol on stdio
 ```
 
@@ -141,12 +142,42 @@ and nothing to reopen.
 ## Saved results
 
 The JSON report is also the cache. Every record carries a `digest` over the
-question set, the model name and the exact state sent for that file, so a rerun
-only calls the API for files whose digest changed: edit three files in a 300
-file repo and the next run costs three requests. `--refresh` reclassifies
-everything, and changing a question invalidates every digest by itself. With
+question set, the model name, the exact state sent for that file, and the
+applied agent-rule rubric when one matches, so a rerun only calls the API for
+files whose digest changed: edit three files in a 300 file repo and the next
+run costs three requests. `--refresh` reclassifies everything, and changing a
+question or a matching model rule invalidates the digests that used it. With
 nothing to reclassify the run needs no API key at all, so reopening the window
 to browse the last result is free.
+
+## Agent-rule rubric
+
+The six architecture dimensions are fixed. The target repository's own
+instruction files are not. painpoints discovers `AGENTS.md`, `AGENT.md`,
+`CLAUDE.md`, `AGENTS.txt`, `.cursorrules`, `.cursor/rules/**/*.{md,mdc}`,
+`.github/copilot-instructions.md`, `.claude/CLAUDE.md`, nested `AGENTS.md` /
+`CLAUDE.md` (scoped to that subtree), and pointer files that say "read X".
+It compiles those into a committed, hand-editable `.painpoints/rubric.json`
+in the same shape as [Abide](https://github.com/coldteadotai/abide): sources
+with hashes, and rules bucketed as `lint`, `model`, `deferred` or
+`unenforceable`. There are no built-in extra rules.
+
+```
+painpoints compile .
+```
+
+Classify loads that rubric (or compiles it if it is missing or stale against
+source hashes). Active `model` rules whose `scope` matches the file become
+extra Jev questions on the same SystemOne call as the six dimensions.
+Violations land in `findings` next to architecture pain, as `rule:<id>`,
+quoting the instruction and pointing at `AGENTS.md:12`. Lint rules are
+recorded only. `when: turn` rules are kept in the rubric but not judged on a
+whole-file classify.
+
+The compile is deterministic: it extracts instruction sentences and scaffolds
+a boolean question per model rule. `--draft` prints how to hand-edit those
+questions so a violating file scores near 1 and a clean file near 0. Do not
+add rules the instruction files do not state.
 
 ## For agents
 
@@ -183,10 +214,12 @@ $ painpoints src/routes/admin.ts --json
 }
 ```
 
-`findings` is the part worth acting on: one entry per dimension at 2.0 or
-above, carrying the level the score landed on, its description, and the
-published standard behind it. A healthy file returns an empty `findings` array,
-which is a real answer rather than a shrug.
+`findings` is the part worth acting on: one entry per architecture dimension
+at 2.0 or above, carrying the level the score landed on, its description, and
+the published standard behind it, plus one entry per agent-rule violation
+(`dimension` is `rule:<id>`, `source` is the instruction file and line). A
+healthy file returns an empty `findings` array, which is a real answer rather
+than a shrug.
 
 **The whole codebase.** `painpoints . --json` returns the same shape as the
 saved report: `summary.by_dimension` for the distribution, `files` ranked worst

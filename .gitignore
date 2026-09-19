@@ -1,2 +1,3 @@
 /target
-.painpoints/
+.painpoints/*
+!.painpoints/rubric.json
