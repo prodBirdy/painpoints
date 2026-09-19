@@ -1,6 +1,6 @@
 ---
 name: painpoints
-description: Use when asked where the architectural pain points, technical debt or risky files in a codebase are, which files to refactor first, or to check a file for layering, complexity, data access cost, failure handling, UI cost or trust-boundary risk before or after editing it. Runs the painpoints tool and reads its JSON.
+description: Use when asked where the architectural pain points, technical debt or risky files in a codebase are, which files to refactor first, whether a file breaks the repo's own AGENTS.md / CLAUDE.md rules, or to check a file for layering, complexity, data access cost, failure handling, UI cost or trust-boundary risk before or after editing it. Runs the painpoints tool and reads its JSON.
 ---
 
 # painpoints
@@ -21,7 +21,9 @@ wrong.
 
 The JSON report is the cache. Unchanged files cost no tokens, so rerunning
 after an edit is cheap: only the edited files are reclassified. Pass
-`refresh` only when the question set or model changed.
+`refresh` only when the question set, model, or `.painpoints/rules.json`
+changed. `painpoints compile` writes those agent rules from AGENTS.md and
+friends without calling the model.
 
 ## Read a file result
 
@@ -44,9 +46,10 @@ after an edit is cheap: only the edited files are reclassified. Pass
 }
 ```
 
-- `findings` is the actionable part: one entry per dimension at 2.0 or above,
-  with the level description that matched. An empty array means the file is
-  healthy on every dimension; say so rather than inventing concerns.
+- `findings` is the actionable part: one entry per architecture dimension at
+  2.0 or above, plus one entry per agent-rule violation (`dimension` starts
+  with `rule:`). An empty array means the file is healthy on every dimension
+  and every compiled project rule; say so rather than inventing concerns.
 - `is_pain_point` is `worst_score >= 2.0`.
 - `needs_review` means the model itself was unsure. Read the file before
   acting on its scores.

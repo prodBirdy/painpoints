@@ -148,7 +148,7 @@ impl PainPoints {
     fn pain_points(&self) -> usize {
         self.records
             .iter()
-            .filter(|r| r.worst_score >= PAIN_THRESHOLD)
+            .filter(|r| r.worst_score >= PAIN_THRESHOLD || r.has_rule_violation())
             .count()
     }
 
@@ -683,6 +683,48 @@ impl PainPoints {
                             .child(dimension.levels[level_of(score)]),
                     )
                     .child(label(dimension.source)),
+            );
+        }
+
+        for verdict in &record.rule_verdicts {
+            if verdict.band == "clear" {
+                continue;
+            }
+            let color = if verdict.band == "act" { DANGER } else { WARN };
+            detail = detail.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .p(px(12.))
+                    .rounded(px(10.))
+                    .bg(rgb(RAISED))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .flex_grow()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(TEXT))
+                                    .child(SharedString::from(verdict.rule_id.clone())),
+                            )
+                            .child(number(
+                                format!("{:.2}", verdict.probability),
+                                36.,
+                                color,
+                                12.,
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(MUTED))
+                            .child(SharedString::from(verdict.text.clone())),
+                    )
+                    .child(label(SharedString::from(verdict.source.clone()))),
             );
         }
 

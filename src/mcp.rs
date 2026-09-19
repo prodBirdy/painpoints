@@ -30,6 +30,24 @@ pub fn findings(record: &Record) -> Vec<Value> {
             })
         })
         .collect();
+    for verdict in &record.rule_verdicts {
+        if verdict.band != "act" {
+            continue;
+        }
+        found.push(json!({
+            "dimension": format!("rule:{}", verdict.rule_id),
+            "label": verdict.rule_id.replace('-', " "),
+            "score": round2_value(verdict.score),
+            "level": level_of(verdict.score),
+            "description": verdict.text,
+            "source": verdict.source,
+            "url": "",
+            "kind": "rule",
+            "ruleId": verdict.rule_id,
+            "probability": verdict.probability,
+            "band": verdict.band,
+        }));
+    }
     found.sort_by(|a, b| {
         b["score"]
             .as_f64()
@@ -50,7 +68,7 @@ pub fn file_result(record: &Record, cached: bool) -> Value {
         "worst_score": round2_value(record.worst_score),
         "total_score": round2_value(record.total_score),
         "needs_review": record.needs_review,
-        "is_pain_point": record.worst_score >= PAIN_THRESHOLD,
+        "is_pain_point": record.worst_score >= PAIN_THRESHOLD || record.has_rule_violation(),
         "pain_threshold": PAIN_THRESHOLD,
         "findings": findings(record),
         "cached": cached,
@@ -163,7 +181,7 @@ fn tools() -> Value {
         {
             "name": "painpoints_file",
             "title": "Classify one file",
-            "description": "Score a single source file on six architectural pain dimensions and return the atomic result: every score, the worst one, and a finding per dimension at 2.0 or above carrying the level description and the published standard it was judged against. Reuses the saved report as a cache, so an unchanged file costs no tokens.",
+            "description": "Score a single source file on six architectural pain dimensions and, when .painpoints/rules.json has matching model rules, on those project agent rules. Returns every score, the worst dimension, and findings: architecture dimensions at 2.0 or above plus rule:<id> violations. Reuses the saved report as a cache, so an unchanged file costs no tokens.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -182,7 +200,7 @@ fn tools() -> Value {
         {
             "name": "painpoints_repo",
             "title": "Classify a repository",
-            "description": "Score every source file in a repository and return the distribution plus the worst files, each with its findings. Writes the full JSON and Markdown report next to the repository. Only files whose contents changed cost tokens.",
+            "description": "Score every source file in a repository on the six architecture dimensions and any matching agent-rule model questions from .painpoints/rules.json. Returns the distribution plus the worst files, each with its findings. Writes the full JSON and Markdown report next to the repository. Only files whose contents changed cost tokens.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -317,7 +335,27 @@ mod tests {
             total_score: 7.0,
             needs_review: false,
             digest: "abc".into(),
+            rule_verdicts: Vec::new(),
         }
+    }
+
+    fn record_with_rule() -> Record {
+        let mut record = record();
+        record.scores.data_access_cost = 0.4;
+        record.scores.failure_handling = 0.3;
+        record.worst_dimension = "complexity".into();
+        record.worst_score = 0.6;
+        record.total_score = 2.5;
+        record.rule_verdicts = vec![crate::rules::RuleVerdict {
+            rule_id: "no-raw-error".into(),
+            text: "Never show a user a raw error".into(),
+            source: "AGENTS.md:4".into(),
+            probability: 0.86,
+            band: "act".into(),
+            score: 2.58,
+            answer: None,
+        }];
+        record
     }
 
     #[test]
@@ -338,6 +376,19 @@ mod tests {
         assert_eq!(value["is_pain_point"], true);
         assert_eq!(value["cached"], true);
         assert_eq!(value["scores"]["data_access_cost"], 2.7);
+    }
+
+    #[test]
+    fn rule_violations_show_up_as_findings() {
+        let found = findings(&record_with_rule());
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0]["dimension"], "rule:no-raw-error");
+        assert_eq!(found[0]["kind"], "rule");
+        assert!(found[0]["description"].as_str().unwrap().contains("raw error"));
+        assert_eq!(found[0]["source"], "AGENTS.md:4");
+        assert_eq!(found[0]["url"], "");
+        let value = file_result(&record_with_rule(), false);
+        assert_eq!(value["is_pain_point"], true);
     }
 
     #[test]

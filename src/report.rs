@@ -70,7 +70,7 @@ impl Report {
     fn pain_points(&self) -> usize {
         self.records
             .iter()
-            .filter(|r| r.worst_score >= PAIN_THRESHOLD)
+            .filter(|r| r.worst_score >= PAIN_THRESHOLD || r.has_rule_violation())
             .count()
     }
 
@@ -94,12 +94,21 @@ impl Report {
                 (d.key, hits)
             })
             .collect();
+        let mut by_rule = BTreeMap::new();
+        for record in &self.records {
+            for verdict in &record.rule_verdicts {
+                if verdict.band == "act" {
+                    *by_rule.entry(verdict.rule_id.as_str()).or_insert(0) += 1;
+                }
+            }
+        }
 
         json!({
             "files_classified": self.records.len(),
             "pain_points": self.pain_points(),
             "needs_review": self.records.iter().filter(|r| r.needs_review).count(),
             "by_dimension": by_dimension,
+            "by_rule": by_rule,
             "by_role": self.tally(|r| r.role.as_str()),
             "usage": self.usage,
         })
@@ -217,6 +226,30 @@ impl Report {
             }
         }
 
+        let mut rule_hits: Vec<(&str, &str, f32, &str)> = Vec::new();
+        for record in &ranked {
+            for verdict in &record.rule_verdicts {
+                if verdict.band == "act" {
+                    rule_hits.push((
+                        record.path.as_str(),
+                        verdict.rule_id.as_str(),
+                        verdict.probability,
+                        verdict.source.as_str(),
+                    ));
+                }
+            }
+        }
+        if !rule_hits.is_empty() {
+            let _ = writeln!(out, "\n## Agent rule violations\n");
+            let _ = writeln!(
+                out,
+                "These files break a model rule compiled from the repository's own instruction files into `.painpoints/rules.json`.\n"
+            );
+            for (path, rule, probability, source) in rule_hits.iter().take(PER_DIMENSION) {
+                let _ = writeln!(out, "- `{path}` `{rule}` ({probability:.2}) from `{source}`");
+            }
+        }
+
         let unsure: Vec<&&Record> = ranked.iter().filter(|r| r.needs_review).collect();
         if !unsure.is_empty() {
             let _ = writeln!(out, "\n## Low confidence\n");
@@ -273,6 +306,7 @@ mod tests {
             total_score: values.iter().sum(),
             needs_review: false,
             digest: "cafe".into(),
+            rule_verdicts: Vec::new(),
         }
     }
 
@@ -317,5 +351,27 @@ mod tests {
         assert_eq!(value["summary"]["by_dimension"]["data_access_cost"], 1);
         assert_eq!(value["summary"]["by_dimension"]["complexity"], 0);
         assert_eq!(value["files"][0]["path"], "hot.ts");
+        assert!(value["summary"]["by_rule"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn agent_rule_violations_are_listed() {
+        let mut report = report();
+        report.records[0].rule_verdicts = vec![crate::rules::RuleVerdict {
+            rule_id: "no-raw-error".into(),
+            text: "Never show a user a raw error".into(),
+            source: "AGENTS.md:4".into(),
+            probability: 0.9,
+            band: "act".into(),
+            score: 2.7,
+            answer: None,
+        }];
+        let markdown = report.markdown();
+        assert!(markdown.contains("Agent rule violations"));
+        assert!(markdown.contains("no-raw-error"));
+        assert!(markdown.contains("AGENTS.md:4"));
+        let value = report.json();
+        assert_eq!(value["summary"]["by_rule"]["no-raw-error"], 1);
+        assert_eq!(value["summary"]["pain_points"], 2);
     }
 }
