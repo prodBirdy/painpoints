@@ -334,16 +334,17 @@ pub fn to_record(state: &FileState, answers: &Answers) -> Record {
         trust_boundary_risk: answers.trust_boundary_risk.score,
     };
     let values = scores.values();
-    let worst = values
-        .iter()
-        .enumerate()
-        .fold((0usize, f32::MIN), |best, (i, &v)| {
-            if v > best.1 {
-                (i, v)
-            } else {
-                best
-            }
-        });
+    let worst =
+        values.iter().enumerate().fold(
+            (0usize, f32::MIN),
+            |best, (i, &v)| {
+                if v > best.1 {
+                    (i, v)
+                } else {
+                    best
+                }
+            },
+        );
     let confidences = [
         answers.boundary_leak.confidence,
         answers.complexity.confidence,
@@ -397,7 +398,11 @@ impl Client {
         })
     }
 
-    pub async fn classify(&self, state: &FileState, agent_rules: Option<&RulesFile>) -> Result<(Record, Usage)> {
+    pub async fn classify(
+        &self,
+        state: &FileState,
+        agent_rules: Option<&RulesFile>,
+    ) -> Result<(Record, Usage)> {
         let questions = questions_for(state, agent_rules);
         let body = json!({ "model": self.model, "state": state, "questions": questions });
         let mut backoff = std::time::Duration::from_millis(500);
@@ -435,17 +440,26 @@ impl Client {
             }
             let retryable = status.as_u16() == 429 || status.is_server_error();
             if !retryable || attempt == 3 {
-                bail!(
-                    "{} from {}: {}",
-                    status,
-                    self.endpoint,
-                    res.text().await.unwrap_or_default()
-                );
+                let body = res.text().await.unwrap_or_default();
+                bail!("{}", classify_http_error(status, &state.path, &body));
             }
             tokio::time::sleep(backoff).await;
             backoff *= 2;
         }
         unreachable!()
+    }
+}
+
+pub fn classify_http_error(status: reqwest::StatusCode, path: &str, body: &str) -> String {
+    let body = body.trim();
+    if body.is_empty() {
+        format!(
+            "HTTP {} classifying {path}: {}",
+            status.as_u16(),
+            status.canonical_reason().unwrap_or("request failed")
+        )
+    } else {
+        format!("HTTP {} classifying {path}: {body}", status.as_u16())
     }
 }
 
@@ -516,11 +530,17 @@ mod tests {
     #[test]
     fn the_endpoint_is_built_from_the_base_url() {
         assert_eq!(
-            format!("{}{SYSTEM_ONE_PATH}", DEFAULT_BASE_URL.trim_end_matches('/')),
+            format!(
+                "{}{SYSTEM_ONE_PATH}",
+                DEFAULT_BASE_URL.trim_end_matches('/')
+            ),
             "https://api.typesafe.ai/v1/systemone"
         );
         assert_eq!(
-            format!("{}{SYSTEM_ONE_PATH}", "https://gateway.example/typesafe/".trim_end_matches('/')),
+            format!(
+                "{}{SYSTEM_ONE_PATH}",
+                "https://gateway.example/typesafe/".trim_end_matches('/')
+            ),
             "https://gateway.example/typesafe/v1/systemone"
         );
     }
@@ -553,7 +573,8 @@ mod tests {
             when: Some("edit".into()),
             check: rules::Check::Model {
                 question: rules::Question::Boolean {
-                    instructions: "Does this file put raw exception text where a user will see it?".into(),
+                    instructions: "Does this file put raw exception text where a user will see it?"
+                        .into(),
                     criteria: None,
                 },
                 overlaps: None,
@@ -583,7 +604,15 @@ mod tests {
         file.path = "server/src/routes/fm.ts".into();
         let with_rules = questions_for(&file, Some(&compiled));
         assert!(with_rules.get("rule:no-raw-error").is_some());
-        assert_eq!(with_rules["rule:no-raw-error"]["type"], "boolean");
+        assert_eq!(with_rules["rule:no-raw-error"]["type"], "choice");
+        assert_eq!(
+            with_rules["rule:no-raw-error"]["criteria"]["true"],
+            "the file breaks the rule"
+        );
+        assert_eq!(
+            with_rules["rule:no-raw-error"]["criteria"]["false"],
+            "the file follows the rule"
+        );
         for dimension in DIMENSIONS {
             assert_eq!(with_rules[dimension.key]["type"], "score");
         }
@@ -637,5 +666,21 @@ mod tests {
         assert!(record.rule_verdicts.is_empty());
         assert_eq!(record.scores.data_access_cost, 2.7);
         assert!(!record.has_rule_violation());
+    }
+
+    #[test]
+    fn classify_errors_include_status_and_response_body() {
+        let status = reqwest::StatusCode::BAD_REQUEST;
+        let err = classify_http_error(
+            status,
+            "src/lib.rs",
+            r#"{"detail":{"error_type":"api_usage_error","message":"Invalid request."}}"#,
+        );
+        assert!(err.contains("HTTP 400"));
+        assert!(err.contains("src/lib.rs"));
+        assert!(err.contains("api_usage_error"));
+        assert!(err.contains("Invalid request."));
+        let bare = classify_http_error(status, "a.ts", "  ");
+        assert_eq!(bare, "HTTP 400 classifying a.ts: Bad Request");
     }
 }

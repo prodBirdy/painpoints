@@ -174,9 +174,10 @@ recorded only. `when: turn` rules are kept in `rules.json` but not judged on a
 whole-file classify.
 
 The compile is deterministic: it extracts instruction sentences and scaffolds
-a boolean question per model rule. `--draft` prints how to hand-edit those
-questions so a violating file scores near 1 and a clean file near 0. Do not
-add rules the instruction files do not state.
+a choice question (true/false criteria, `violating: ["true"]`) per model rule.
+`--draft` prints how to hand-edit those questions so a violating file scores
+near 1 and a clean file near 0. Do not add rules the instruction files do not
+state.
 
 ## For agents
 
