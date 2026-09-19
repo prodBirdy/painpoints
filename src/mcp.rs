@@ -181,7 +181,7 @@ fn tools() -> Value {
         {
             "name": "painpoints_file",
             "title": "Classify one file",
-            "description": "Score a single source file on six architectural pain dimensions and, when .painpoints/rubric.json has matching model rules, on those project agent rules. Returns every score, the worst dimension, and findings: architecture dimensions at 2.0 or above plus rule:<id> violations. Reuses the saved report as a cache, so an unchanged file costs no tokens.",
+            "description": "Score a single source file on six architectural pain dimensions and, when .painpoints/rules.json has matching model rules, on those project agent rules. Returns every score, the worst dimension, and findings: architecture dimensions at 2.0 or above plus rule:<id> violations. Reuses the saved report as a cache, so an unchanged file costs no tokens.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -200,7 +200,7 @@ fn tools() -> Value {
         {
             "name": "painpoints_repo",
             "title": "Classify a repository",
-            "description": "Score every source file in a repository on the six architecture dimensions and any matching agent-rule model questions from .painpoints/rubric.json. Returns the distribution plus the worst files, each with its findings. Writes the full JSON and Markdown report next to the repository. Only files whose contents changed cost tokens.",
+            "description": "Score every source file in a repository on the six architecture dimensions and any matching agent-rule model questions from .painpoints/rules.json. Returns the distribution plus the worst files, each with its findings. Writes the full JSON and Markdown report next to the repository. Only files whose contents changed cost tokens.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -346,7 +346,7 @@ mod tests {
         record.worst_dimension = "complexity".into();
         record.worst_score = 0.6;
         record.total_score = 2.5;
-        record.rule_verdicts = vec![crate::rubric::RuleVerdict {
+        record.rule_verdicts = vec![crate::rules::RuleVerdict {
             rule_id: "no-raw-error".into(),
             text: "Never show a user a raw error".into(),
             source: "AGENTS.md:4".into(),

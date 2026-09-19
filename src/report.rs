@@ -243,7 +243,7 @@ impl Report {
             let _ = writeln!(out, "\n## Agent rule violations\n");
             let _ = writeln!(
                 out,
-                "These files break a model rule compiled from the repository's own instruction files into `.painpoints/rubric.json`.\n"
+                "These files break a model rule compiled from the repository's own instruction files into `.painpoints/rules.json`.\n"
             );
             for (path, rule, probability, source) in rule_hits.iter().take(PER_DIMENSION) {
                 let _ = writeln!(out, "- `{path}` `{rule}` ({probability:.2}) from `{source}`");
@@ -357,7 +357,7 @@ mod tests {
     #[test]
     fn agent_rule_violations_are_listed() {
         let mut report = report();
-        report.records[0].rule_verdicts = vec![crate::rubric::RuleVerdict {
+        report.records[0].rule_verdicts = vec![crate::rules::RuleVerdict {
             rule_id: "no-raw-error".into(),
             text: "Never show a user a raw error".into(),
             source: "AGENTS.md:4".into(),

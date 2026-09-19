@@ -67,7 +67,7 @@ painpoints mcp
   --json            print the result to stdout as JSON
   --refresh         reclassify everything instead of reusing the saved report
 
-  compile [TARGET]  discover AGENTS.md and friends, write .painpoints/rubric.json
+  compile [TARGET]  discover AGENTS.md and friends, write .painpoints/rules.json
   mcp               serve the Model Context Protocol on stdio
 ```
 
@@ -143,35 +143,34 @@ and nothing to reopen.
 
 The JSON report is also the cache. Every record carries a `digest` over the
 question set, the model name, the exact state sent for that file, and the
-applied agent-rule rubric when one matches, so a rerun only calls the API for
+applied agent rules when any match, so a rerun only calls the API for
 files whose digest changed: edit three files in a 300 file repo and the next
 run costs three requests. `--refresh` reclassifies everything, and changing a
 question or a matching model rule invalidates the digests that used it. With
 nothing to reclassify the run needs no API key at all, so reopening the window
 to browse the last result is free.
 
-## Agent-rule rubric
+## Agent rules
 
 The six architecture dimensions are fixed. The target repository's own
 instruction files are not. painpoints discovers `AGENTS.md`, `AGENT.md`,
 `CLAUDE.md`, `AGENTS.txt`, `.cursorrules`, `.cursor/rules/**/*.{md,mdc}`,
 `.github/copilot-instructions.md`, `.claude/CLAUDE.md`, nested `AGENTS.md` /
 `CLAUDE.md` (scoped to that subtree), and pointer files that say "read X".
-It compiles those into a committed, hand-editable `.painpoints/rubric.json`
-in the same shape as [Abide](https://github.com/coldteadotai/abide): sources
-with hashes, and rules bucketed as `lint`, `model`, `deferred` or
+It compiles those into a committed, hand-editable `.painpoints/rules.json`:
+sources with hashes, and rules bucketed as `lint`, `model`, `deferred` or
 `unenforceable`. There are no built-in extra rules.
 
 ```
 painpoints compile .
 ```
 
-Classify loads that rubric (or compiles it if it is missing or stale against
+Classify loads that file (or compiles it if it is missing or stale against
 source hashes). Active `model` rules whose `scope` matches the file become
 extra Jev questions on the same SystemOne call as the six dimensions.
 Violations land in `findings` next to architecture pain, as `rule:<id>`,
 quoting the instruction and pointing at `AGENTS.md:12`. Lint rules are
-recorded only. `when: turn` rules are kept in the rubric but not judged on a
+recorded only. `when: turn` rules are kept in `rules.json` but not judged on a
 whole-file classify.
 
 The compile is deterministic: it extracts instruction sentences and scaffolds

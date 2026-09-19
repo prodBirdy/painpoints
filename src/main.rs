@@ -1,7 +1,7 @@
 mod jev;
 mod mcp;
 mod report;
-mod rubric;
+mod rules;
 mod run;
 mod scan;
 mod ui;
@@ -26,7 +26,7 @@ painpoints mcp
   --refresh         reclassify everything instead of reusing the saved report
   -h, --help        this text
 
-  compile           discover AGENTS.md and friends, write .painpoints/rubric.json
+  compile           discover AGENTS.md and friends, write .painpoints/rules.json
   --draft           after compile, print how to hand-edit model questions
   mcp               serve the Model Context Protocol on stdio, exposing
                     painpoints_file and painpoints_repo
@@ -75,14 +75,14 @@ fn compile_cmd() -> Result<()> {
     }
     let dest = out
         .unwrap_or_else(|| root.join(".painpoints"))
-        .join(rubric::RUBRIC_FILE);
-    let candidates = rubric::discover(&root);
+        .join(rules::RULES_FILE);
+    let candidates = rules::discover(&root);
     if candidates.is_empty() {
         eprintln!("found 0 instruction files under {}", root.display());
         return Ok(());
     }
-    let compiled = rubric::compile(&root, &candidates);
-    rubric::write(&dest, &compiled)?;
+    let compiled = rules::compile(&root, &candidates);
+    rules::write(&dest, &compiled)?;
     let (model, lint, deferred, unenforceable) = compiled.bucket_counts();
     eprintln!(
         "compiled {} rules from {} files → {}",
@@ -92,7 +92,7 @@ fn compile_cmd() -> Result<()> {
     );
     eprintln!("  {model} model, {lint} lint, {deferred} deferred, {unenforceable} unenforceable");
     if draft {
-        println!("{}", rubric::draft_notes(&compiled, &dest));
+        println!("{}", rules::draft_notes(&compiled, &dest));
     }
     Ok(())
 }

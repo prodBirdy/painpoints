@@ -1,4 +1,4 @@
-use crate::rubric::{self, RuleVerdict, Rubric};
+use crate::rules::{self, RuleVerdict, RulesFile};
 use anyhow::{bail, Context as _, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -185,7 +185,7 @@ static QUESTIONS_DIGEST: LazyLock<u64> = LazyLock::new(|| {
     hasher.finish()
 });
 
-pub fn digest(state: &FileState, rubric: Option<&Rubric>) -> String {
+pub fn digest(state: &FileState, agent_rules: Option<&RulesFile>) -> String {
     let mut hasher = DefaultHasher::new();
     QUESTIONS_DIGEST.hash(&mut hasher);
     model().hash(&mut hasher);
@@ -193,7 +193,7 @@ pub fn digest(state: &FileState, rubric: Option<&Rubric>) -> String {
     state.lines.hash(&mut hasher);
     state.truncated.hash(&mut hasher);
     state.source.hash(&mut hasher);
-    if let Some(applied) = rubric
+    if let Some(applied) = agent_rules
         .map(|r| r.applied_digest(&state.path))
         .filter(|d| !d.is_empty())
     {
@@ -202,11 +202,11 @@ pub fn digest(state: &FileState, rubric: Option<&Rubric>) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-pub fn questions_for(state: &FileState, rubric: Option<&Rubric>) -> Value {
-    let Some(rubric) = rubric else {
+pub fn questions_for(state: &FileState, agent_rules: Option<&RulesFile>) -> Value {
+    let Some(agent_rules) = agent_rules else {
         return QUESTIONS.clone();
     };
-    rubric::questions_for_rules(QUESTIONS.clone(), &rubric.model_rules_for(&state.path))
+    rules::questions_for_rules(QUESTIONS.clone(), &agent_rules.model_rules_for(&state.path))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -397,8 +397,8 @@ impl Client {
         })
     }
 
-    pub async fn classify(&self, state: &FileState, rubric: Option<&Rubric>) -> Result<(Record, Usage)> {
-        let questions = questions_for(state, rubric);
+    pub async fn classify(&self, state: &FileState, agent_rules: Option<&RulesFile>) -> Result<(Record, Usage)> {
+        let questions = questions_for(state, agent_rules);
         let body = json!({ "model": self.model, "state": state, "questions": questions });
         let mut backoff = std::time::Duration::from_millis(500);
         for attempt in 0..4 {
@@ -419,13 +419,13 @@ impl Client {
                     .and_then(|v| serde_json::from_value(v.clone()).ok())
                     .unwrap_or_default();
                 let mut record = to_record(state, &answers);
-                record.digest = digest(state, rubric);
-                if let Some(rubric) = rubric {
-                    let rules = rubric.model_rules_for(&state.path);
-                    record.rule_verdicts = rubric::verdicts_from_answers(
+                record.digest = digest(state, agent_rules);
+                if let Some(agent_rules) = agent_rules {
+                    let matching = agent_rules.model_rules_for(&state.path);
+                    record.rule_verdicts = rules::verdicts_from_answers(
                         &parsed["answers"],
-                        &rules,
-                        rubric.thresholds(),
+                        &matching,
+                        agent_rules.thresholds(),
                     );
                     if record.rule_verdicts.iter().any(|v| v.band == "flag") {
                         record.needs_review = true;
@@ -541,18 +541,18 @@ mod tests {
         assert!(!keys.contains_key("agent_rule_compliance"));
     }
 
-    fn model_rule(id: &str, scope: Option<Vec<String>>) -> rubric::Rule {
-        rubric::Rule {
+    fn model_rule(id: &str, scope: Option<Vec<String>>) -> rules::Rule {
+        rules::Rule {
             id: id.into(),
             text: "Never show a user a raw error".into(),
-            source: rubric::RuleSource {
+            source: rules::RuleSource {
                 path: "AGENTS.md".into(),
                 line: Some(4),
             },
             scope,
             when: Some("edit".into()),
-            check: rubric::Check::Model {
-                question: rubric::Question::Boolean {
+            check: rules::Check::Model {
+                question: rules::Question::Boolean {
                     instructions: "Does this file put raw exception text where a user will see it?".into(),
                     criteria: None,
                 },
@@ -562,8 +562,8 @@ mod tests {
         }
     }
 
-    fn sample_rubric(rules: Vec<rubric::Rule>) -> Rubric {
-        Rubric {
+    fn sample_rules(rules: Vec<rules::Rule>) -> RulesFile {
+        RulesFile {
             version: 1,
             compiled_at: "2026-09-19T00:00:00Z".into(),
             compiled_by: Some("painpoints".into()),
@@ -575,13 +575,13 @@ mod tests {
 
     #[test]
     fn questions_include_matching_model_rules_only() {
-        let rubric = sample_rubric(vec![model_rule(
+        let compiled = sample_rules(vec![model_rule(
             "no-raw-error",
             Some(vec!["server/**/*.ts".into()]),
         )]);
         let mut file = state();
         file.path = "server/src/routes/fm.ts".into();
-        let with_rules = questions_for(&file, Some(&rubric));
+        let with_rules = questions_for(&file, Some(&compiled));
         assert!(with_rules.get("rule:no-raw-error").is_some());
         assert_eq!(with_rules["rule:no-raw-error"]["type"], "boolean");
         for dimension in DIMENSIONS {
@@ -589,7 +589,7 @@ mod tests {
         }
 
         file.path = "client/src/App.tsx".into();
-        let without = questions_for(&file, Some(&rubric));
+        let without = questions_for(&file, Some(&compiled));
         assert!(without.get("rule:no-raw-error").is_none());
         assert_eq!(without, *QUESTIONS);
         assert_eq!(questions_for(&file, None), *QUESTIONS);
@@ -599,16 +599,16 @@ mod tests {
     fn digest_is_stable_without_rules_and_moves_when_they_change() {
         let file = state();
         let empty = digest(&file, None);
-        let unused = sample_rubric(vec![model_rule(
+        let unused = sample_rules(vec![model_rule(
             "no-raw-error",
             Some(vec!["apps/web/**/*".into()]),
         )]);
         assert_eq!(digest(&file, Some(&unused)), empty);
 
-        let matching = sample_rubric(vec![model_rule("no-raw-error", None)]);
+        let matching = sample_rules(vec![model_rule("no-raw-error", None)]);
         let first = digest(&file, Some(&matching));
         assert_ne!(first, empty);
-        let changed = sample_rubric(vec![model_rule("use-yup", None)]);
+        let changed = sample_rules(vec![model_rule("use-yup", None)]);
         assert_ne!(digest(&file, Some(&changed)), first);
     }
 

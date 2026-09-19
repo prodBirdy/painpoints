@@ -1,5 +1,5 @@
 use crate::jev::{digest, Client, FileState, Record, Usage};
-use crate::rubric::{self, Rubric};
+use crate::rules::{self, RulesFile};
 use anyhow::Result;
 use futures::stream::{FuturesUnordered, StreamExt};
 use ignore::WalkBuilder;
@@ -220,11 +220,11 @@ pub async fn run(
 ) -> Result<()> {
     let files = collect_files(&config);
     let _ = tx.send(Event::Started { total: files.len() });
-    let rubric: Option<Rubric> = match rubric::load_or_compile(&config.root) {
+    let agent_rules: Option<RulesFile> = match rules::load_or_compile(&config.root) {
         Ok(value) => value,
         Err(err) => {
             let _ = tx.send(Event::Failed {
-                path: "<rubric>".into(),
+                path: "<rules>".into(),
                 error: err.to_string(),
             });
             None
@@ -237,7 +237,7 @@ pub async fn run(
         let job = match read_state(&config.root, &file) {
             Ok(state) => match cache
                 .get(&state.path)
-                .filter(|record| record.digest == digest(&state, rubric.as_ref()))
+                .filter(|record| record.digest == digest(&state, agent_rules.as_ref()))
             {
                 Some(record) => Job::Ready(Box::new(record.clone())),
                 None => Job::Classify(Box::new(state)),
@@ -265,7 +265,7 @@ pub async fn run(
     }
 
     let client = Arc::new(Client::new()?);
-    let rubric = Arc::new(rubric);
+    let agent_rules = Arc::new(agent_rules);
     let mut total = Usage::default();
     let mut pending = FuturesUnordered::new();
     let mut queue = queue.into_iter();
@@ -274,10 +274,10 @@ pub async fn run(
                       pending: &mut FuturesUnordered<_>| {
         if let Some(state) = queue.next() {
             let client = client.clone();
-            let rubric = rubric.clone();
+            let agent_rules = agent_rules.clone();
             pending.push(async move {
                 client
-                    .classify(&state, rubric.as_ref().as_ref())
+                    .classify(&state, agent_rules.as_ref().as_ref())
                     .await
                     .map_err(|err| (state.path.clone(), err.to_string()))
             });

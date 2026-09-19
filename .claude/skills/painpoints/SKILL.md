@@ -21,9 +21,9 @@ wrong.
 
 The JSON report is the cache. Unchanged files cost no tokens, so rerunning
 after an edit is cheap: only the edited files are reclassified. Pass
-`refresh` only when the question set, model, or `.painpoints/rubric.json`
-changed. `painpoints compile` writes that rubric from AGENTS.md and friends
-without calling the model.
+`refresh` only when the question set, model, or `.painpoints/rules.json`
+changed. `painpoints compile` writes those agent rules from AGENTS.md and
+friends without calling the model.
 
 ## Read a file result
 

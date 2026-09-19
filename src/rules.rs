@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const RUBRIC_VERSION: u32 = 1;
-pub const RUBRIC_FILE: &str = "rubric.json";
+pub const RULES_VERSION: u32 = 1;
+pub const RULES_FILE: &str = "rules.json";
 pub const MAX_RULES: usize = 40;
 pub const MAX_RULE_TEXT_CHARS: usize = 6000;
 pub const MAX_RULE_QUESTIONS: usize = 20;
@@ -43,20 +43,20 @@ const SKIP_DIRS: &[&str] = &[
 const MAX_WALK_DEPTH: usize = 6;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Rubric {
+pub struct RulesFile {
     pub version: u32,
     #[serde(rename = "compiledAt")]
     pub compiled_at: String,
     #[serde(rename = "compiledBy", skip_serializing_if = "Option::is_none")]
     pub compiled_by: Option<String>,
-    pub sources: Vec<RubricSource>,
+    pub sources: Vec<RulesSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thresholds: Option<Thresholds>,
     pub rules: Vec<Rule>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct RubricSource {
+pub struct RulesSource {
     pub path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sha: Option<String>,
@@ -219,7 +219,7 @@ fn round2<S: serde::Serializer>(value: &f32, serializer: S) -> Result<S::Ok, S::
     serializer.serialize_f64(((*value as f64) * 100.0).round() / 100.0)
 }
 
-impl Rubric {
+impl RulesFile {
     pub fn thresholds(&self) -> Thresholds {
         self.thresholds.unwrap_or_default()
     }
@@ -273,30 +273,30 @@ impl Rubric {
     }
 }
 
-pub fn rubric_path(root: &Path) -> PathBuf {
-    root.join(".painpoints").join(RUBRIC_FILE)
+pub fn rules_path(root: &Path) -> PathBuf {
+    root.join(".painpoints").join(RULES_FILE)
 }
 
-pub fn load(path: &Path) -> Option<Rubric> {
+pub fn load(path: &Path) -> Option<RulesFile> {
     let bytes = std::fs::read(path).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
-pub fn write(path: &Path, rubric: &Rubric) -> Result<()> {
+pub fn write(path: &Path, rules: &RulesFile) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let body = serde_json::to_vec_pretty(rubric)?;
+    let body = serde_json::to_vec_pretty(rules)?;
     std::fs::write(path, body).with_context(|| format!("writing {}", path.display()))
 }
 
-pub fn is_stale(rubric: &Rubric, candidates: &[SourceCandidate], root: &Path) -> bool {
-    let listed: HashSet<String> = rubric
+pub fn is_stale(rules: &RulesFile, candidates: &[SourceCandidate], root: &Path) -> bool {
+    let listed: HashSet<String> = rules
         .sources
         .iter()
         .map(|s| normalize_rel(&s.path))
         .collect();
-    for source in &rubric.sources {
+    for source in &rules.sources {
         let absolute = resolve_source(root, &source.path);
         match std::fs::read(&absolute) {
             Ok(bytes) => match &source.sha {
@@ -311,20 +311,20 @@ pub fn is_stale(rubric: &Rubric, candidates: &[SourceCandidate], root: &Path) ->
         .any(|c| !listed.contains(&normalize_rel(&c.path)))
 }
 
-pub fn load_or_compile(root: &Path) -> Result<Option<Rubric>> {
+pub fn load_or_compile(root: &Path) -> Result<Option<RulesFile>> {
     let candidates = discover(root);
     if candidates.is_empty() {
         return Ok(None);
     }
-    let path = rubric_path(root);
+    let path = rules_path(root);
     if let Some(existing) = load(&path) {
         if !is_stale(&existing, &candidates, root) {
             return Ok(Some(existing));
         }
     }
-    let rubric = compile(root, &candidates);
-    write(&path, &rubric)?;
-    Ok(Some(rubric))
+    let compiled = compile(root, &candidates);
+    write(&path, &compiled)?;
+    Ok(Some(compiled))
 }
 
 pub fn discover(root: &Path) -> Vec<SourceCandidate> {
@@ -467,7 +467,7 @@ fn cursor_rule_scope(root: &Path, file: &Path) -> String {
     "**/*".into()
 }
 
-pub fn compile(_root: &Path, candidates: &[SourceCandidate]) -> Rubric {
+pub fn compile(_root: &Path, candidates: &[SourceCandidate]) -> RulesFile {
     let mut sources = Vec::new();
     let mut rules = Vec::new();
     let mut used_ids = HashSet::new();
@@ -480,14 +480,14 @@ pub fn compile(_root: &Path, candidates: &[SourceCandidate]) -> Rubric {
         let sha = sha256_hex(&bytes);
         let text = String::from_utf8_lossy(&bytes);
         if pointer_target(&text).is_some() {
-            sources.push(RubricSource {
+            sources.push(RulesSource {
                 path: candidate.path.clone(),
                 sha: Some(sha),
                 scope: Some(candidate.scope.clone()),
             });
             continue;
         }
-        sources.push(RubricSource {
+        sources.push(RulesSource {
             path: candidate.path.clone(),
             sha: Some(sha),
             scope: Some(candidate.scope.clone()),
@@ -523,8 +523,8 @@ pub fn compile(_root: &Path, candidates: &[SourceCandidate]) -> Rubric {
         }
     }
 
-    Rubric {
-        version: RUBRIC_VERSION,
+    RulesFile {
+        version: RULES_VERSION,
         compiled_at: utc_now(),
         compiled_by: Some("painpoints".into()),
         sources,
@@ -1384,18 +1384,18 @@ pub fn questions_for_rules(base: Value, rules: &[&Rule]) -> Value {
     questions
 }
 
-pub fn draft_notes(rubric: &Rubric, dest: &Path) -> String {
-    let (model, lint, deferred, unenforceable) = rubric.bucket_counts();
+pub fn draft_notes(rules: &RulesFile, dest: &Path) -> String {
+    let (model, lint, deferred, unenforceable) = rules.bucket_counts();
     format!(
-        "Rubric written to {} ({} rules: {model} model, {lint} lint, {deferred} deferred, {unenforceable} unenforceable).\n\
+        "Agent rules written to {} ({} rules: {model} model, {lint} lint, {deferred} deferred, {unenforceable} unenforceable).\n\
          \n\
          The compile is deterministic: it extracts instruction sentences and scaffolds a boolean\n\
-         Jev question per model rule. To refine questions the way Abide's compile skill does,\n\
-         edit check.question on each model rule in that file. A violating file should score near 1\n\
-         and a clean file near 0. Keep instructions under 60 words. Ask about existence in this\n\
-         file, not a judgment of the whole. Do not add rules the instruction files do not state.",
+         Jev question per model rule. To refine those questions, edit check.question on each\n\
+         model rule in that file. A violating file should score near 1 and a clean file near 0.\n\
+         Keep instructions under 60 words. Ask about existence in this file, not a judgment of\n\
+         the whole. Do not add rules the instruction files do not state.",
         dest.display(),
-        rubric.rules.len()
+        rules.rules.len()
     )
 }
 
@@ -1414,7 +1414,7 @@ mod tests {
     }
 
     fn fixture(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("painpoints-rubric-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("painpoints-rules-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -1466,8 +1466,8 @@ mod tests {
         let found = discover(&root);
         let nested = found.iter().find(|c| c.path == "apps/web/AGENTS.md").unwrap();
         assert_eq!(nested.scope, "apps/web/**/*");
-        let rubric = compile(&root, &found);
-        let nested_rule = rubric
+        let rules = compile(&root, &found);
+        let nested_rule = rules
             .rules
             .iter()
             .find(|r| r.source.path == "apps/web/AGENTS.md")
@@ -1498,18 +1498,18 @@ mod tests {
     fn compile_extracts_quoted_rules_and_buckets_them() {
         let root = fixture("compile");
         write_tree(&root, &[("AGENTS.md", AGENTS)]);
-        let rubric = compile(&root, &discover(&root));
-        assert_eq!(rubric.version, 1);
-        assert_eq!(rubric.compiled_by.as_deref(), Some("painpoints"));
-        assert_eq!(rubric.sources[0].path, "AGENTS.md");
-        assert!(rubric.sources[0].sha.as_ref().unwrap().len() == 64);
+        let rules = compile(&root, &discover(&root));
+        assert_eq!(rules.version, 1);
+        assert_eq!(rules.compiled_by.as_deref(), Some("painpoints"));
+        assert_eq!(rules.sources[0].path, "AGENTS.md");
+        assert!(rules.sources[0].sha.as_ref().unwrap().len() == 64);
 
         let by_text = |needle: &str| {
-            rubric
+            rules
                 .rules
                 .iter()
                 .find(|r| r.text.to_ascii_lowercase().contains(needle))
-                .unwrap_or_else(|| panic!("missing {needle} in {:?}", rubric.rules))
+                .unwrap_or_else(|| panic!("missing {needle} in {:?}", rules.rules))
         };
 
         assert!(matches!(by_text("yup").check, Check::Model { .. }));
@@ -1531,13 +1531,13 @@ mod tests {
         let root = fixture("empty");
         write_tree(&root, &[("README.md", "hello\n")]);
         assert!(discover(&root).is_empty());
-        let rubric = compile(&root, &[]);
-        assert!(rubric.rules.is_empty());
-        assert!(rubric.sources.is_empty());
+        let rules = compile(&root, &[]);
+        assert!(rules.rules.is_empty());
+        assert!(rules.sources.is_empty());
     }
 
     #[test]
-    fn rubric_round_trips_and_old_json_without_optional_fields_loads() {
+    fn rules_file_round_trips_and_old_json_without_optional_fields_loads() {
         let json = r#"{
             "version": 1,
             "compiledAt": "2026-09-19T00:00:00Z",
@@ -1556,10 +1556,10 @@ mod tests {
                 }
             }]
         }"#;
-        let rubric: Rubric = serde_json::from_str(json).unwrap();
-        assert_eq!(rubric.rules[0].status, "active");
-        assert_eq!(rubric.thresholds(), Thresholds::default());
-        let again: Rubric = serde_json::from_str(&serde_json::to_string(&rubric).unwrap()).unwrap();
+        let rules: RulesFile = serde_json::from_str(json).unwrap();
+        assert_eq!(rules.rules[0].status, "active");
+        assert_eq!(rules.thresholds(), Thresholds::default());
+        let again: RulesFile = serde_json::from_str(&serde_json::to_string(&rules).unwrap()).unwrap();
         assert_eq!(again.rules[0].id, "use-yup");
     }
 
@@ -1583,7 +1583,7 @@ mod tests {
             },
             status: "active".into(),
         };
-        let rubric = Rubric {
+        let rules = RulesFile {
             version: 1,
             compiled_at: "2026-09-19T00:00:00Z".into(),
             compiled_by: Some("painpoints".into()),
@@ -1591,13 +1591,13 @@ mod tests {
             thresholds: None,
             rules: vec![rule],
         };
-        assert_eq!(rubric.model_rules_for("src/api.ts").len(), 1);
-        assert!(rubric.model_rules_for("README.md").is_empty());
-        let applied = rubric.applied_digest("src/api.ts");
+        assert_eq!(rules.model_rules_for("src/api.ts").len(), 1);
+        assert!(rules.model_rules_for("README.md").is_empty());
+        let applied = rules.applied_digest("src/api.ts");
         assert!(!applied.is_empty());
-        assert!(rubric.applied_digest("README.md").is_empty());
+        assert!(rules.applied_digest("README.md").is_empty());
 
-        let questions = questions_for_rules(json!({ "role": { "type": "choice" } }), &rubric.model_rules_for("src/api.ts"));
+        let questions = questions_for_rules(json!({ "role": { "type": "choice" } }), &rules.model_rules_for("src/api.ts"));
         assert!(questions.get("rule:no-raw-error").is_some());
         assert_eq!(questions["rule:no-raw-error"]["type"], "boolean");
         let none = questions_for_rules(json!({ "role": { "type": "choice" } }), &[]);
@@ -1622,10 +1622,10 @@ mod tests {
         let root = fixture("stale");
         write_tree(&root, &[("AGENTS.md", "- Use Yup, never validate by hand.\n")]);
         let candidates = discover(&root);
-        let rubric = compile(&root, &candidates);
-        assert!(!is_stale(&rubric, &candidates, &root));
+        let rules = compile(&root, &candidates);
+        assert!(!is_stale(&rules, &candidates, &root));
         std::fs::write(root.join("AGENTS.md"), "- Use Zod, never validate by hand.\n").unwrap();
-        assert!(is_stale(&rubric, &discover(&root), &root));
+        assert!(is_stale(&rules, &discover(&root), &root));
     }
 
     #[test]
@@ -1667,7 +1667,7 @@ mod tests {
         assert!(glob_matches("apps/web/**/*", "apps/web/src/page.ts"));
         assert!(!glob_matches("apps/web/**/*", "apps/api/src/page.ts"));
         assert!(glob_matches("**/*.{ts,tsx}", "src/a.tsx"));
-        assert!(glob_matches("src/**/*.rs", "src/rubric.rs"));
+        assert!(glob_matches("src/**/*.rs", "src/rules.rs"));
         assert!(!glob_matches("src/**/*.rs", "docs/readme.md"));
     }
 
@@ -1691,7 +1691,7 @@ mod tests {
             },
             status: "active".into(),
         };
-        let rubric = Rubric {
+        let rules = RulesFile {
             version: 1,
             compiled_at: String::new(),
             compiled_by: None,
@@ -1699,13 +1699,13 @@ mod tests {
             thresholds: None,
             rules: vec![rule.clone()],
         };
-        assert!(rubric.model_rules_for("src/a.rs").is_empty());
+        assert!(rules.model_rules_for("src/a.rs").is_empty());
         rule.when = Some("edit".into());
         rule.status = "disabled".into();
-        let rubric = Rubric {
+        let rules = RulesFile {
             rules: vec![rule],
-            ..rubric
+            ..rules
         };
-        assert!(rubric.model_rules_for("src/a.rs").is_empty());
+        assert!(rules.model_rules_for("src/a.rs").is_empty());
     }
 }
