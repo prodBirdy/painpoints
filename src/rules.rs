@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet};
@@ -41,6 +42,19 @@ const SKIP_DIRS: &[&str] = &[
     ".abide",
 ];
 const MAX_WALK_DEPTH: usize = 6;
+const SKIP_NESTED_PREFIXES: &[&str] = &[".claude/worktrees", ".cursor/worktrees"];
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CompileNotes {
+    pub omitted: Vec<OmittedSource>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OmittedSource {
+    pub source: String,
+    pub count: usize,
+    pub reason: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RulesFile {
@@ -89,10 +103,7 @@ pub struct Rule {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub when: Option<String>,
     pub check: Check,
-    #[serde(
-        default = "default_active",
-        skip_serializing_if = "is_active"
-    )]
+    #[serde(default = "default_active", skip_serializing_if = "is_active")]
     pub status: String,
 }
 
@@ -166,11 +177,12 @@ impl Question {
                 instructions,
                 criteria,
             } => {
-                let mut value = json!({ "type": "boolean", "instructions": instructions });
-                if let Some(criteria) = criteria {
-                    value["criteria"] = json!(criteria);
-                }
-                value
+                // SystemOne has no boolean type; send the true/false pair as a choice.
+                json!({
+                    "type": "choice",
+                    "instructions": instructions,
+                    "criteria": boolean_criteria(criteria.as_ref()),
+                })
             }
             Question::Choice {
                 instructions,
@@ -191,6 +203,16 @@ impl Question {
                 "criteria": criteria,
             }),
         }
+    }
+}
+
+fn boolean_criteria(criteria: Option<&BTreeMap<String, String>>) -> BTreeMap<String, String> {
+    match criteria {
+        Some(existing) if !existing.is_empty() => existing.clone(),
+        _ => BTreeMap::from([
+            ("true".into(), "the file breaks the rule".into()),
+            ("false".into(), "the file follows the rule".into()),
+        ]),
     }
 }
 
@@ -225,7 +247,8 @@ impl RulesFile {
     }
 
     pub fn model_rules_for(&self, file: &str) -> Vec<&Rule> {
-        self.rules
+        let mut matching: Vec<&Rule> = self
+            .rules
             .iter()
             .filter(|rule| {
                 rule.status == "active"
@@ -233,8 +256,16 @@ impl RulesFile {
                     && rule.when.as_deref() != Some("turn")
                     && rule_applies_to(rule, file)
             })
-            .take(MAX_RULE_QUESTIONS)
-            .collect()
+            .collect();
+        matching.sort_by(|a, b| {
+            path_scoped(&b.scope)
+                .cmp(&path_scoped(&a.scope))
+                .then_with(|| process_like(&a.text).cmp(&process_like(&b.text)))
+                .then_with(|| a.source.path.cmp(&b.source.path))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        matching.truncate(MAX_RULE_QUESTIONS);
+        matching
     }
 
     pub fn applied_digest(&self, file: &str) -> String {
@@ -249,7 +280,11 @@ impl RulesFile {
             buf.extend_from_slice(rule.text.as_bytes());
             buf.push(0);
             if let Check::Model { question, .. } = &rule.check {
-                buf.extend_from_slice(serde_json::to_string(question).unwrap_or_default().as_bytes());
+                buf.extend_from_slice(
+                    serde_json::to_string(question)
+                        .unwrap_or_default()
+                        .as_bytes(),
+                );
             }
             buf.push(b'\n');
         }
@@ -322,7 +357,8 @@ pub fn load_or_compile(root: &Path) -> Result<Option<RulesFile>> {
             return Ok(Some(existing));
         }
     }
-    let compiled = compile(root, &candidates);
+    let (compiled, notes) = compile_with_notes(root, &candidates);
+    print_truncation(&notes);
     write(&path, &compiled)?;
     Ok(Some(compiled))
 }
@@ -356,7 +392,11 @@ pub fn discover(root: &Path) -> Vec<SourceCandidate> {
         i += 1;
     }
 
-    found.sort_by(|a, b| a.path.cmp(&b.path));
+    found.sort_by(|a, b| {
+        let a_root = a.scope == "**/*";
+        let b_root = b.scope == "**/*";
+        b_root.cmp(&a_root).then_with(|| a.path.cmp(&b.path))
+    });
     found
 }
 
@@ -391,6 +431,21 @@ fn walk_nested(
     if depth > MAX_WALK_DEPTH {
         return;
     }
+    let gitignore = load_gitignore(root);
+    walk_nested_inner(root, dir, depth, found, seen, &gitignore);
+}
+
+fn walk_nested_inner(
+    root: &Path,
+    dir: &Path,
+    depth: usize,
+    found: &mut Vec<SourceCandidate>,
+    seen: &mut HashSet<String>,
+    gitignore: &Gitignore,
+) {
+    if depth > MAX_WALK_DEPTH {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -407,22 +462,49 @@ fn walk_nested(
             continue;
         }
         let rel = rel_path(root, &path);
+        if skip_nested_rel(&rel) || gitignored(gitignore, &rel, true) {
+            continue;
+        }
         if !rel.is_empty() {
             for file_name in NESTED_NAMES {
                 let file = path.join(file_name);
+                let file_rel = rel_path(root, &file);
+                if gitignored(gitignore, &file_rel, false) {
+                    continue;
+                }
                 let scope = format!("{rel}/**/*");
                 push_file(root, file, &scope, found, seen);
             }
         }
-        walk_nested(root, &path, depth + 1, found, seen);
+        walk_nested_inner(root, &path, depth + 1, found, seen, gitignore);
     }
 }
 
-fn walk_cursor_rules(
-    root: &Path,
-    found: &mut Vec<SourceCandidate>,
-    seen: &mut HashSet<String>,
-) {
+fn skip_nested_rel(rel: &str) -> bool {
+    SKIP_NESTED_PREFIXES
+        .iter()
+        .any(|prefix| rel == *prefix || rel.starts_with(&format!("{prefix}/")))
+}
+
+fn load_gitignore(root: &Path) -> Gitignore {
+    let mut builder = GitignoreBuilder::new(root);
+    let file = root.join(".gitignore");
+    if file.is_file() {
+        let _ = builder.add(&file);
+    }
+    builder.build().unwrap_or_else(|_| Gitignore::empty())
+}
+
+fn gitignored(gitignore: &Gitignore, rel: &str, is_dir: bool) -> bool {
+    if rel.is_empty() {
+        return false;
+    }
+    gitignore
+        .matched_path_or_any_parents(rel, is_dir)
+        .is_ignore()
+}
+
+fn walk_cursor_rules(root: &Path, found: &mut Vec<SourceCandidate>, seen: &mut HashSet<String>) {
     let dir = root.join(".cursor/rules");
     if !dir.is_dir() {
         return;
@@ -467,11 +549,16 @@ fn cursor_rule_scope(root: &Path, file: &Path) -> String {
     "**/*".into()
 }
 
-pub fn compile(_root: &Path, candidates: &[SourceCandidate]) -> RulesFile {
+pub fn compile(root: &Path, candidates: &[SourceCandidate]) -> RulesFile {
+    compile_with_notes(root, candidates).0
+}
+
+pub fn compile_with_notes(
+    _root: &Path,
+    candidates: &[SourceCandidate],
+) -> (RulesFile, CompileNotes) {
     let mut sources = Vec::new();
-    let mut rules = Vec::new();
-    let mut used_ids = HashSet::new();
-    let mut text_chars = 0usize;
+    let mut drafts: Vec<Rule> = Vec::new();
 
     for candidate in candidates {
         let Ok(bytes) = std::fs::read(&candidate.absolute) else {
@@ -479,37 +566,37 @@ pub fn compile(_root: &Path, candidates: &[SourceCandidate]) -> RulesFile {
         };
         let sha = sha256_hex(&bytes);
         let text = String::from_utf8_lossy(&bytes);
-        if pointer_target(&text).is_some() {
-            sources.push(RulesSource {
-                path: candidate.path.clone(),
-                sha: Some(sha),
-                scope: Some(candidate.scope.clone()),
-            });
-            continue;
-        }
         sources.push(RulesSource {
             path: candidate.path.clone(),
             sha: Some(sha),
             scope: Some(candidate.scope.clone()),
         });
+        if pointer_target(&text).is_some() {
+            continue;
+        }
 
         let scope_globs = scope_globs(&candidate.scope);
         for extracted in extract_statements(&candidate.path, &text) {
-            if rules.len() >= MAX_RULES || text_chars + extracted.text.len() > MAX_RULE_TEXT_CHARS {
-                break;
-            }
-            if rules.iter().any(|r: &Rule| same_rule(&r.text, &extracted.text)) {
+            if let Some(existing) = drafts
+                .iter_mut()
+                .find(|r| same_rule(&r.text, &extracted.text))
+            {
+                if scope_rank(&scope_globs) < scope_rank(&existing.scope) {
+                    existing.scope = scope_globs.clone();
+                    existing.source = RuleSource {
+                        path: candidate.path.clone(),
+                        line: Some(extracted.line),
+                    };
+                }
                 continue;
             }
-            let id = unique_id(&extracted.text, &mut used_ids);
             let check = classify_rule(&extracted.text);
             let when = match check {
                 Check::Model { .. } => Some("edit".into()),
                 _ => None,
             };
-            text_chars += extracted.text.len();
-            rules.push(Rule {
-                id,
+            drafts.push(Rule {
+                id: String::new(),
                 text: extracted.text,
                 source: RuleSource {
                     path: candidate.path.clone(),
@@ -523,13 +610,88 @@ pub fn compile(_root: &Path, candidates: &[SourceCandidate]) -> RulesFile {
         }
     }
 
-    RulesFile {
-        version: RULES_VERSION,
-        compiled_at: utc_now(),
-        compiled_by: Some("painpoints".into()),
-        sources,
-        thresholds: None,
-        rules,
+    let (model, others): (Vec<Rule>, Vec<Rule>) = drafts
+        .into_iter()
+        .partition(|rule| matches!(rule.check, Check::Model { .. }));
+    let mut model = model;
+    model.sort_by(|a, b| {
+        path_scoped(&b.scope)
+            .cmp(&path_scoped(&a.scope))
+            .then_with(|| process_like(&a.text).cmp(&process_like(&b.text)))
+            .then_with(|| a.source.path.cmp(&b.source.path))
+            .then_with(|| a.source.line.cmp(&b.source.line))
+    });
+
+    let mut kept_model = Vec::new();
+    let mut omitted_counts: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let mut text_chars = 0usize;
+    for rule in model {
+        let reason = if kept_model.len() >= MAX_RULES {
+            Some(format!("{MAX_RULES} model-rule cap"))
+        } else if text_chars + rule.text.len() > MAX_RULE_TEXT_CHARS {
+            Some(format!("{MAX_RULE_TEXT_CHARS}-char model-rule budget"))
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            *omitted_counts
+                .entry((rule.source.path.clone(), reason))
+                .or_insert(0) += 1;
+            continue;
+        }
+        text_chars += rule.text.len();
+        kept_model.push(rule);
+    }
+
+    let mut rules = others;
+    rules.append(&mut kept_model);
+    rules.sort_by(|a, b| {
+        a.source
+            .path
+            .cmp(&b.source.path)
+            .then_with(|| a.source.line.cmp(&b.source.line))
+    });
+
+    let mut used_ids = HashSet::new();
+    for rule in &mut rules {
+        rule.id = unique_id(&rule.text, &mut used_ids);
+    }
+
+    let notes = CompileNotes {
+        omitted: omitted_counts
+            .into_iter()
+            .map(|((source, reason), count)| OmittedSource {
+                source,
+                count,
+                reason,
+            })
+            .collect(),
+    };
+
+    (
+        RulesFile {
+            version: RULES_VERSION,
+            compiled_at: utc_now(),
+            compiled_by: Some("painpoints".into()),
+            sources,
+            thresholds: None,
+            rules,
+        },
+        notes,
+    )
+}
+
+pub fn print_truncation(notes: &CompileNotes) {
+    if notes.omitted.is_empty() {
+        return;
+    }
+    let total: usize = notes.omitted.iter().map(|o| o.count).sum();
+    eprintln!(
+        "omitted {total} model rules from {} sources:",
+        notes.omitted.len()
+    );
+    for item in &notes.omitted {
+        eprintln!("  {} — {} ({})", item.source, item.count, item.reason);
     }
 }
 
@@ -565,9 +727,7 @@ fn extract_statements(path: &str, text: &str) -> Vec<Extracted> {
         }
         let item = match list_item(trimmed) {
             Some(item) => item,
-            None if looks_like_instruction(trimmed) && trimmed.len() < 400 => {
-                trimmed.to_string()
-            }
+            None if looks_like_instruction(trimmed) && trimmed.len() < 400 => trimmed.to_string(),
             None => continue,
         };
         let item = clean_rule_text(&item);
@@ -607,7 +767,10 @@ fn list_item(line: &str) -> Option<String> {
 fn clean_rule_text(text: &str) -> String {
     let mut text = text.trim().to_string();
     if (text.starts_with("**") && text.ends_with("**") && text.len() > 4)
-        || (text.starts_with('*') && text.ends_with('*') && text.len() > 2 && !text.starts_with("**"))
+        || (text.starts_with('*')
+            && text.ends_with('*')
+            && text.len() > 2
+            && !text.starts_with("**"))
     {
         text = text.trim_matches('*').trim().to_string();
     }
@@ -620,7 +783,9 @@ fn clean_rule_text(text: &str) -> String {
     } else if let Some((head, tail)) = text.split_once(":** ") {
         text = format!("{}: {}", head.trim_matches('*').trim(), tail.trim());
     }
-    text.trim_end_matches(|c| c == '.' || c == ';').trim().to_string()
+    text.trim_end_matches(|c| c == '.' || c == ';')
+        .trim()
+        .to_string()
 }
 
 fn looks_like_instruction(text: &str) -> bool {
@@ -660,9 +825,29 @@ fn looks_like_instruction(text: &str) -> bool {
         return true;
     }
     const STARTS: &[&str] = &[
-        "use ", "don't", "do not", "never ", "always ", "avoid ", "prefer ", "keep ",
-        "write ", "make ", "put ", "leave ", "treat ", "score ", "run ", "ask ",
-        "state ", "touch ", "match ", "remove ", "preserve ", "pass ", "verify ",
+        "use ",
+        "don't",
+        "do not",
+        "never ",
+        "always ",
+        "avoid ",
+        "prefer ",
+        "keep ",
+        "write ",
+        "make ",
+        "put ",
+        "leave ",
+        "treat ",
+        "score ",
+        "run ",
+        "ask ",
+        "state ",
+        "touch ",
+        "match ",
+        "remove ",
+        "preserve ",
+        "pass ",
+        "verify ",
     ];
     STARTS.iter().any(|s| lower.starts_with(s))
 }
@@ -691,12 +876,44 @@ fn fluff(lower: &str) -> bool {
     SKIP.iter().any(|s| lower.starts_with(s) || lower == *s)
 }
 
+fn path_scoped(scope: &Option<Vec<String>>) -> bool {
+    match scope {
+        None => false,
+        Some(globs) => globs.iter().any(|g| g != "**/*" && !g.is_empty()),
+    }
+}
+
+fn process_like(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    conversation_rule(&lower) || process_rule(&lower)
+}
+
+fn scope_rank(scope: &Option<Vec<String>>) -> i32 {
+    match scope {
+        None => 0,
+        Some(globs) if globs.iter().any(|g| g == "**/*" || g.is_empty()) => 0,
+        Some(globs) => globs
+            .iter()
+            .map(|g| {
+                let mut n = g.matches('/').count() as i32 + 1;
+                if SKIP_NESTED_PREFIXES.iter().any(|prefix| g.contains(prefix))
+                    || g.contains("/worktrees/")
+                {
+                    n += 100;
+                }
+                n
+            })
+            .min()
+            .unwrap_or(1),
+    }
+}
+
 fn classify_rule(text: &str) -> Check {
     let lower = text.to_ascii_lowercase();
 
-    if conversation_rule(&lower) {
+    if conversation_rule(&lower) || process_rule(&lower) {
         return Check::Unenforceable {
-            reason: "about the conversation, not the code".into(),
+            reason: "about the conversation or process, not the code".into(),
         };
     }
     if needs_repo_context(&lower) {
@@ -748,6 +965,55 @@ fn conversation_rule(lower: &str) -> bool {
         "no ai attribution",
         "co-authored-by",
         "generated with",
+    ];
+    MARKERS.iter().any(|m| lower.contains(m))
+}
+
+fn process_rule(lower: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "branch name",
+        "name the branch",
+        "name branches",
+        "git branch",
+        "create a branch",
+        "checkout -b",
+        "worktree",
+        "pull request",
+        "open a pr",
+        "create a pr",
+        "create the pr",
+        "pr title",
+        "pr body",
+        "pr description",
+        "commit message",
+        "git commit",
+        "git push",
+        "git fetch",
+        "git pull",
+        "force push",
+        "don't push",
+        "do not push",
+        "never push",
+        "subagent",
+        "spawn a subagent",
+        "model slug",
+        "reasoning budget",
+        "use composer-",
+        "use sonnet",
+        "use opus",
+        "use gpt-",
+        "use claude-",
+        "don't install",
+        "do not install",
+        "never install",
+        "brew install",
+        "apt install",
+        "cargo install",
+        "stacked pr",
+        "base branch",
+        "don't merge",
+        "do not merge",
+        "create a worktree",
     ];
     MARKERS.iter().any(|m| lower.contains(m))
 }
@@ -819,7 +1085,8 @@ fn lint_shape(lower: &str, text: &str) -> Option<(String, String)> {
     if lower.contains("date.now()") || lower.contains("`date.now`") {
         return Some(("no-restricted-syntax".into(), r"Date\.now\(".into()));
     }
-    if lower.contains(" as ") && (lower.contains("cast") || lower.contains("no type casting") || lower.contains("`as`"))
+    if lower.contains(" as ")
+        && (lower.contains("cast") || lower.contains("no type casting") || lower.contains("`as`"))
     {
         return Some((
             "@typescript-eslint/consistent-type-assertions".into(),
@@ -827,10 +1094,16 @@ fn lint_shape(lower: &str, text: &str) -> Option<(String, String)> {
         ));
     }
     if lower.contains("npm install") || lower.contains("yarn add") || lower.contains("pnpm add") {
-        return Some(("no-restricted-syntax".into(), r"npm install|yarn add|pnpm add".into()));
+        return Some((
+            "no-restricted-syntax".into(),
+            r"npm install|yarn add|pnpm add".into(),
+        ));
     }
     if lower.contains(": any") || lower.contains("`any`") && lower.contains("type") {
-        return Some(("@typescript-eslint/no-explicit-any".into(), r":\s*any\b".into()));
+        return Some((
+            "@typescript-eslint/no-explicit-any".into(),
+            r":\s*any\b".into(),
+        ));
     }
     let _ = text;
     None
@@ -840,11 +1113,12 @@ fn scaffold_question(text: &str) -> Question {
     let mut criteria = BTreeMap::new();
     criteria.insert("true".into(), format!("the file breaks: {text}"));
     criteria.insert("false".into(), format!("the file follows: {text}"));
-    Question::Boolean {
+    Question::Choice {
         instructions: format!(
             "Does this file violate the project rule: \"{text}\"? Answer true only if the file as written breaks that rule."
         ),
-        criteria: Some(criteria),
+        criteria,
+        violating: vec!["true".into()],
     }
 }
 
@@ -952,7 +1226,10 @@ fn expand_braces(pattern: &str) -> Vec<String> {
 }
 
 fn glob_match(pattern: &str, path: &str) -> bool {
-    let pat: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty() || pattern == "/").collect();
+    let pat: Vec<&str> = pattern
+        .split('/')
+        .filter(|s| !s.is_empty() || pattern == "/")
+        .collect();
     let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     glob_segs(&pat, &segs)
 }
@@ -1040,7 +1317,9 @@ pub fn pointer_target(text: &str) -> Option<String> {
 
 fn frontmatter(text: &str) -> Option<String> {
     let text = text.trim_start_matches('\u{feff}');
-    let rest = text.strip_prefix("---\n").or_else(|| text.strip_prefix("---\r\n"))?;
+    let rest = text
+        .strip_prefix("---\n")
+        .or_else(|| text.strip_prefix("---\r\n"))?;
     let end = rest.find("\n---").or_else(|| rest.find("\r\n---"))?;
     Some(rest[..end].to_string())
 }
@@ -1129,7 +1408,13 @@ fn sha256(input: &[u8]) -> [u8; 32] {
         0xc67178f2,
     ];
     let mut state = [
-        0x6a09e667u32, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x6a09e667u32,
+        0xbb67ae85,
+        0x3c6ef372,
+        0xa54ff53a,
+        0x510e527f,
+        0x9b05688c,
+        0x1f83d9ab,
         0x5be0cd19,
     ];
     let bit_len = (input.len() as u64).saturating_mul(8);
@@ -1262,26 +1547,38 @@ pub fn band_for(probability: f32, thresholds: Thresholds) -> &'static str {
 pub fn violation_probability(question: &Question, answer: &Value) -> (f32, Option<String>) {
     match question {
         Question::Boolean { .. } => {
+            if let Some(choice) = answer.get("choice").and_then(Value::as_str) {
+                if let Some(probs) = answer.get("probabilities").and_then(Value::as_object) {
+                    let mass = probs.get("true").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+                    return (mass.clamp(0.0, 1.0), Some(choice.to_string()));
+                }
+                let p = if choice.eq_ignore_ascii_case("true") || choice.eq_ignore_ascii_case("yes")
+                {
+                    1.0
+                } else {
+                    0.0
+                };
+                return (p, Some(choice.to_string()));
+            }
             let p = answer
                 .get("probability")
                 .and_then(Value::as_f64)
                 .or_else(|| {
-                    answer.get("boolean").and_then(Value::as_bool).map(|b| {
-                        if b {
-                            1.0
-                        } else {
-                            0.0
-                        }
-                    })
+                    answer.get("boolean").and_then(Value::as_bool).map(
+                        |b| {
+                            if b {
+                                1.0
+                            } else {
+                                0.0
+                            }
+                        },
+                    )
                 })
                 .or_else(|| {
-                    answer.get("answer").and_then(Value::as_bool).map(|b| {
-                        if b {
-                            1.0
-                        } else {
-                            0.0
-                        }
-                    })
+                    answer
+                        .get("answer")
+                        .and_then(Value::as_bool)
+                        .map(|b| if b { 1.0 } else { 0.0 })
                 })
                 .unwrap_or(0.0) as f32;
             (p.clamp(0.0, 1.0), None)
@@ -1312,8 +1609,14 @@ pub fn violation_probability(question: &Question, answer: &Value) -> (f32, Optio
             ..
         } => {
             let score = answer.get("score").and_then(Value::as_f64).unwrap_or(0.0);
-            let level = score.round().clamp(0.0, (criteria.len().saturating_sub(1)) as f64) as usize;
-            let label = criteria.get(level).cloned().unwrap_or_else(|| level.to_string());
+            let level = score
+                .round()
+                .clamp(0.0, (criteria.len().saturating_sub(1)) as f64)
+                as usize;
+            let label = criteria
+                .get(level)
+                .cloned()
+                .unwrap_or_else(|| level.to_string());
             if let Some(probs) = answer.get("probabilities").and_then(Value::as_object) {
                 let mass: f32 = probs
                     .iter()
@@ -1389,11 +1692,12 @@ pub fn draft_notes(rules: &RulesFile, dest: &Path) -> String {
     format!(
         "Agent rules written to {} ({} rules: {model} model, {lint} lint, {deferred} deferred, {unenforceable} unenforceable).\n\
          \n\
-         The compile is deterministic: it extracts instruction sentences and scaffolds a boolean\n\
-         Jev question per model rule. To refine those questions, edit check.question on each\n\
-         model rule in that file. A violating file should score near 1 and a clean file near 0.\n\
-         Keep instructions under 60 words. Ask about existence in this file, not a judgment of\n\
-         the whole. Do not add rules the instruction files do not state.",
+         The compile is deterministic: it extracts instruction sentences and scaffolds a choice\n\
+         Jev question (true/false criteria, violating: [\"true\"]) per model rule. To refine those\n\
+         questions, edit check.question on each model rule in that file. A violating file should\n\
+         score near 1 and a clean file near 0. Keep instructions under 60 words. Ask about\n\
+         existence in this file, not a judgment of the whole. Do not add rules the instruction\n\
+         files do not state.",
         dest.display(),
         rules.rules.len()
     )
@@ -1414,7 +1718,8 @@ mod tests {
     }
 
     fn fixture(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("painpoints-rules-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("painpoints-rules-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -1439,7 +1744,10 @@ mod tests {
                 ("CLAUDE.md", "Read AGENTS.md\n"),
                 (".cursorrules", "- Prefer named exports.\n"),
                 (".github/copilot-instructions.md", "- No default exports.\n"),
-                (".cursor/rules/frontend.mdc", "---\nglobs: apps/web/**/*\n---\n- No inline styles.\n"),
+                (
+                    ".cursor/rules/frontend.mdc",
+                    "---\nglobs: apps/web/**/*\n---\n- No inline styles.\n",
+                ),
                 ("apps/web/AGENTS.md", "- Server files stay in src/server.\n"),
                 ("apps/web/src/page.ts", "export {}\n"),
             ],
@@ -1460,11 +1768,17 @@ mod tests {
             &root,
             &[
                 ("AGENTS.md", "- Root rule.\n"),
-                ("apps/web/AGENTS.md", "- Keep server handlers in src/server.\n"),
+                (
+                    "apps/web/AGENTS.md",
+                    "- Keep server handlers in src/server.\n",
+                ),
             ],
         );
         let found = discover(&root);
-        let nested = found.iter().find(|c| c.path == "apps/web/AGENTS.md").unwrap();
+        let nested = found
+            .iter()
+            .find(|c| c.path == "apps/web/AGENTS.md")
+            .unwrap();
         assert_eq!(nested.scope, "apps/web/**/*");
         let rules = compile(&root, &found);
         let nested_rule = rules
@@ -1472,7 +1786,10 @@ mod tests {
             .iter()
             .find(|r| r.source.path == "apps/web/AGENTS.md")
             .expect("nested rule");
-        assert_eq!(nested_rule.scope.as_deref(), Some(&["apps/web/**/*".into()][..]));
+        assert_eq!(
+            nested_rule.scope.as_deref(),
+            Some(&["apps/web/**/*".into()][..])
+        );
         assert!(rule_applies_to(nested_rule, "apps/web/src/page.ts"));
         assert!(!rule_applies_to(nested_rule, "apps/api/src/page.ts"));
     }
@@ -1490,8 +1807,14 @@ mod tests {
         let found = discover(&root);
         assert!(found.iter().any(|c| c.path == "AGENTS.md"));
         assert!(found.iter().any(|c| c.path == "CLAUDE.md"));
-        assert_eq!(pointer_target("Read instructions from ./docs/RULES.md\n"), Some("./docs/RULES.md".into()));
-        assert_eq!(pointer_target("# Claude\n\nRead AGENTS.md.\n"), Some("AGENTS.md".into()));
+        assert_eq!(
+            pointer_target("Read instructions from ./docs/RULES.md\n"),
+            Some("./docs/RULES.md".into())
+        );
+        assert_eq!(
+            pointer_target("# Claude\n\nRead AGENTS.md.\n"),
+            Some("AGENTS.md".into())
+        );
     }
 
     #[test]
@@ -1514,16 +1837,25 @@ mod tests {
 
         assert!(matches!(by_text("yup").check, Check::Model { .. }));
         assert!(matches!(by_text("raw error").check, Check::Model { .. }));
-        assert!(matches!(by_text("ask when").check, Check::Unenforceable { .. }));
+        assert!(matches!(
+            by_text("ask when").check,
+            Check::Unenforceable { .. }
+        ));
         assert!(matches!(by_text("200 lines").check, Check::Deferred { .. }));
         assert!(matches!(by_text("interface").check, Check::Lint { .. }));
-        assert!(matches!(by_text("error codes").check, Check::Deferred { .. }));
+        assert!(matches!(
+            by_text("error codes").check,
+            Check::Deferred { .. }
+        ));
 
         let yup = by_text("yup");
         assert_eq!(yup.text, "Use Yup, never validate by hand");
         assert_eq!(yup.source.line, Some(3));
         assert_eq!(yup.when.as_deref(), Some("edit"));
-        assert!(yup.id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
+        assert!(yup
+            .id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
     }
 
     #[test]
@@ -1559,7 +1891,8 @@ mod tests {
         let rules: RulesFile = serde_json::from_str(json).unwrap();
         assert_eq!(rules.rules[0].status, "active");
         assert_eq!(rules.thresholds(), Thresholds::default());
-        let again: RulesFile = serde_json::from_str(&serde_json::to_string(&rules).unwrap()).unwrap();
+        let again: RulesFile =
+            serde_json::from_str(&serde_json::to_string(&rules).unwrap()).unwrap();
         assert_eq!(again.rules[0].id, "use-yup");
     }
 
@@ -1576,7 +1909,8 @@ mod tests {
             when: Some("edit".into()),
             check: Check::Model {
                 question: Question::Boolean {
-                    instructions: "Does this file put raw exception text where a user will see it?".into(),
+                    instructions: "Does this file put raw exception text where a user will see it?"
+                        .into(),
                     criteria: None,
                 },
                 overlaps: None,
@@ -1597,9 +1931,20 @@ mod tests {
         assert!(!applied.is_empty());
         assert!(rules.applied_digest("README.md").is_empty());
 
-        let questions = questions_for_rules(json!({ "role": { "type": "choice" } }), &rules.model_rules_for("src/api.ts"));
+        let questions = questions_for_rules(
+            json!({ "role": { "type": "choice" } }),
+            &rules.model_rules_for("src/api.ts"),
+        );
         assert!(questions.get("rule:no-raw-error").is_some());
-        assert_eq!(questions["rule:no-raw-error"]["type"], "boolean");
+        assert_eq!(questions["rule:no-raw-error"]["type"], "choice");
+        assert_eq!(
+            questions["rule:no-raw-error"]["criteria"]["true"],
+            "the file breaks the rule"
+        );
+        assert_eq!(
+            questions["rule:no-raw-error"]["criteria"]["false"],
+            "the file follows the rule"
+        );
         let none = questions_for_rules(json!({ "role": { "type": "choice" } }), &[]);
         assert!(none.get("rule:no-raw-error").is_none());
     }
@@ -1607,9 +1952,18 @@ mod tests {
     #[test]
     fn digest_changes_when_a_matching_rule_changes() {
         let root = fixture("digest");
-        write_tree(&root, &[("AGENTS.md", "- Never show a user a raw error.\n")]);
+        write_tree(
+            &root,
+            &[("AGENTS.md", "- Never show a user a raw error.\n")],
+        );
         let first = compile(&root, &discover(&root));
-        write_tree(&root, &[("AGENTS.md", "- Never show a user a raw error.\n- Use Yup, never validate by hand.\n")]);
+        write_tree(
+            &root,
+            &[(
+                "AGENTS.md",
+                "- Never show a user a raw error.\n- Use Yup, never validate by hand.\n",
+            )],
+        );
         let second = compile(&root, &discover(&root));
         assert_ne!(
             first.applied_digest("src/lib.rs"),
@@ -1620,11 +1974,18 @@ mod tests {
     #[test]
     fn staleness_tracks_source_hashes() {
         let root = fixture("stale");
-        write_tree(&root, &[("AGENTS.md", "- Use Yup, never validate by hand.\n")]);
+        write_tree(
+            &root,
+            &[("AGENTS.md", "- Use Yup, never validate by hand.\n")],
+        );
         let candidates = discover(&root);
         let rules = compile(&root, &candidates);
         assert!(!is_stale(&rules, &candidates, &root));
-        std::fs::write(root.join("AGENTS.md"), "- Use Zod, never validate by hand.\n").unwrap();
+        std::fs::write(
+            root.join("AGENTS.md"),
+            "- Use Zod, never validate by hand.\n",
+        )
+        .unwrap();
         assert!(is_stale(&rules, &discover(&root), &root));
     }
 
@@ -1707,5 +2068,206 @@ mod tests {
             ..rules
         };
         assert!(rules.model_rules_for("src/a.rs").is_empty());
+    }
+
+    #[test]
+    fn scaffolded_and_legacy_boolean_questions_are_sent_as_choice() {
+        let root = fixture("choice");
+        write_tree(
+            &root,
+            &[("AGENTS.md", "- Use Yup, never validate by hand.\n")],
+        );
+        let rules = compile(&root, &discover(&root));
+        let yup = rules.rules.iter().find(|r| r.text.contains("Yup")).unwrap();
+        match &yup.check {
+            Check::Model {
+                question:
+                    Question::Choice {
+                        violating,
+                        criteria,
+                        ..
+                    },
+                ..
+            } => {
+                assert_eq!(violating, &["true".to_string()]);
+                assert!(criteria.contains_key("true"));
+                assert!(criteria.contains_key("false"));
+            }
+            other => panic!("expected choice, got {other:?}"),
+        }
+
+        let boolean = Question::Boolean {
+            instructions: "broken?".into(),
+            criteria: None,
+        };
+        let sent = boolean.to_jev();
+        assert_eq!(sent["type"], "choice");
+        assert_eq!(sent["criteria"]["true"], "the file breaks the rule");
+        let (p, ans) = violation_probability(
+            &boolean,
+            &json!({ "choice": "true", "probabilities": { "true": 0.91, "false": 0.09 } }),
+        );
+        assert!((p - 0.91).abs() < 0.001);
+        assert_eq!(ans.as_deref(), Some("true"));
+
+        let choice = Question::Choice {
+            instructions: "broken?".into(),
+            criteria: BTreeMap::from([
+                ("true".into(), "breaks".into()),
+                ("false".into(), "follows".into()),
+            ]),
+            violating: vec!["true".into()],
+        };
+        let (p, ans) = violation_probability(
+            &choice,
+            &json!({ "choice": "true", "probabilities": { "true": 0.8, "false": 0.2 } }),
+        );
+        assert!((p - 0.8).abs() < 0.001);
+        assert_eq!(ans.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn discover_skips_claude_worktrees_and_dedupe_keeps_the_broader_scope() {
+        let root = fixture("worktrees");
+        write_tree(
+            &root,
+            &[
+                (".gitignore", ".claude/worktrees/\n"),
+                ("CLAUDE.md", "- Never show a user a raw error.\n"),
+                (
+                    ".claude/worktrees/old/CLAUDE.md",
+                    "- Never show a user a raw error.\n",
+                ),
+                (
+                    ".claude/worktrees/old/AGENTS.md",
+                    "- Use Yup, never validate by hand.\n",
+                ),
+            ],
+        );
+        let found = discover(&root);
+        assert!(
+            !found.iter().any(|c| c.path.contains("worktrees")),
+            "gitignored worktrees must not be sources: {:?}",
+            found.iter().map(|c| &c.path).collect::<Vec<_>>()
+        );
+        assert!(found.iter().any(|c| c.path == "CLAUDE.md"));
+
+        let nested = root.join(".claude/worktrees/old/CLAUDE.md");
+        let candidates = vec![
+            SourceCandidate {
+                path: ".claude/worktrees/old/CLAUDE.md".into(),
+                absolute: nested,
+                scope: ".claude/worktrees/old/**/*".into(),
+            },
+            SourceCandidate {
+                path: "CLAUDE.md".into(),
+                absolute: root.join("CLAUDE.md"),
+                scope: "**/*".into(),
+            },
+        ];
+        let rules = compile(&root, &candidates);
+        let raw = rules
+            .rules
+            .iter()
+            .find(|r| r.text.contains("raw error"))
+            .unwrap();
+        assert!(
+            raw.scope.is_none(),
+            "root rule must keep the broader scope, got {:?}",
+            raw.scope
+        );
+    }
+
+    #[test]
+    fn process_rules_are_unenforceable_and_do_not_eat_the_model_cap() {
+        let root = fixture("process-cap");
+        let mut claude = String::from("# Rules\n\n");
+        claude.push_str("- Always name branches cursor/short-name.\n");
+        claude.push_str("- Write a clear pull request title.\n");
+        claude.push_str("- Create a git worktree instead of switching.\n");
+        claude.push_str("- Use sonnet for the review subagent.\n");
+        claude.push_str("- Never install brew packages without asking.\n");
+        claude.push_str("- Never show a user a raw error.\n");
+        for i in 0..45 {
+            claude.push_str(&format!("- Use helper{i}, never invent a copy.\n"));
+        }
+        write_tree(
+            &root,
+            &[
+                ("CLAUDE.md", &claude),
+                (
+                    ".cursor/rules/api.mdc",
+                    "---\nglobs: src/**/*.rs\n---\n- Keep handlers thin.\n",
+                ),
+            ],
+        );
+        let (rules, notes) = compile_with_notes(&root, &discover(&root));
+        let (model, _, _, unenforceable) = rules.bucket_counts();
+        assert!(
+            unenforceable >= 5,
+            "process rules should be unenforceable, got {unenforceable}"
+        );
+        assert!(model <= MAX_RULES);
+        assert!(
+            rules
+                .rules
+                .iter()
+                .any(|r| r.source.path.contains(".cursor/rules")
+                    && matches!(r.check, Check::Model { .. })),
+            "path-scoped cursor rules must not be dropped for process slots"
+        );
+        assert!(
+            !notes.omitted.is_empty(),
+            "hitting the model cap must list omitted sources, got {notes:?}"
+        );
+        assert!(notes.omitted.iter().any(|o| o.source == "CLAUDE.md"));
+    }
+
+    #[test]
+    fn per_file_question_budget_prefers_path_scoped_rules() {
+        let mut rules = Vec::new();
+        for i in 0..25 {
+            rules.push(Rule {
+                id: format!("global-{i}"),
+                text: format!("Use Global{i}, never invent a copy"),
+                source: RuleSource {
+                    path: "CLAUDE.md".into(),
+                    line: Some(i + 1),
+                },
+                scope: None,
+                when: Some("edit".into()),
+                check: Check::Model {
+                    question: scaffold_question("Use Yup"),
+                    overlaps: None,
+                },
+                status: "active".into(),
+            });
+        }
+        rules.push(Rule {
+            id: "thin-handlers".into(),
+            text: "Keep handlers thin".into(),
+            source: RuleSource {
+                path: ".cursor/rules/api.mdc".into(),
+                line: Some(4),
+            },
+            scope: Some(vec!["src/**/*.rs".into()]),
+            when: Some("edit".into()),
+            check: Check::Model {
+                question: scaffold_question("Keep handlers thin"),
+                overlaps: None,
+            },
+            status: "active".into(),
+        });
+        let file = RulesFile {
+            version: 1,
+            compiled_at: String::new(),
+            compiled_by: None,
+            sources: vec![],
+            thresholds: None,
+            rules,
+        };
+        let picked = file.model_rules_for("src/lib.rs");
+        assert_eq!(picked.len(), MAX_RULE_QUESTIONS);
+        assert_eq!(picked[0].id, "thin-handlers");
     }
 }

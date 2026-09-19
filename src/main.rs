@@ -81,7 +81,7 @@ fn compile_cmd() -> Result<()> {
         eprintln!("found 0 instruction files under {}", root.display());
         return Ok(());
     }
-    let compiled = rules::compile(&root, &candidates);
+    let (compiled, notes) = rules::compile_with_notes(&root, &candidates);
     rules::write(&dest, &compiled)?;
     let (model, lint, deferred, unenforceable) = compiled.bucket_counts();
     eprintln!(
@@ -91,6 +91,7 @@ fn compile_cmd() -> Result<()> {
         dest.display()
     );
     eprintln!("  {model} model, {lint} lint, {deferred} deferred, {unenforceable} unenforceable");
+    rules::print_truncation(&notes);
     if draft {
         println!("{}", rules::draft_notes(&compiled, &dest));
     }
@@ -151,10 +152,7 @@ fn parse() -> Result<Option<Args>> {
 
 fn collect(args: &Args, quiet: bool) -> Result<(Report, run::Outcome, PathBuf)> {
     let root = args.config.root.clone();
-    let dir = args
-        .out
-        .clone()
-        .unwrap_or_else(|| root.join(".painpoints"));
+    let dir = args.out.clone().unwrap_or_else(|| root.join(".painpoints"));
     let cache = if args.refresh {
         Default::default()
     } else {
@@ -187,6 +185,12 @@ fn collect(args: &Args, quiet: bool) -> Result<(Report, run::Outcome, PathBuf)> 
 fn headless(args: Args) -> Result<()> {
     let (report, outcome, dir) = collect(&args, false)?;
     let (json, markdown) = report.write(&dir)?;
+    if !outcome.failures.is_empty() {
+        eprintln!("{} files failed to classify:", outcome.failures.len());
+        for (path, error) in &outcome.failures {
+            eprintln!("  {path}: {error}");
+        }
+    }
     eprintln!(
         "{} files ({} reused), {} pain points, {} in / {} out tokens",
         report.records.len(),
@@ -247,10 +251,7 @@ fn main() -> Result<()> {
     }
 
     let root = args.config.root.clone();
-    let out = args
-        .out
-        .clone()
-        .unwrap_or_else(|| root.join(".painpoints"));
+    let out = args.out.clone().unwrap_or_else(|| root.join(".painpoints"));
     let cache = if args.refresh {
         Default::default()
     } else {

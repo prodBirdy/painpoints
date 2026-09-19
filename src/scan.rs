@@ -142,14 +142,7 @@ pub fn collect_files(config: &Config) -> Vec<PathBuf> {
         if !dir.exists() {
             continue;
         }
-        let walker = WalkBuilder::new(&dir)
-            .filter_entry(|entry| {
-                entry
-                    .file_name()
-                    .to_str()
-                    .is_none_or(|name| !SKIP_DIRS.contains(&name))
-            })
-            .build();
+        let walker = walk_builder(&dir, &config.root).build();
         for entry in walker.flatten() {
             let path = entry.path();
             if !entry.file_type().is_some_and(|t| t.is_file()) {
@@ -177,6 +170,28 @@ pub fn collect_files(config: &Config) -> Vec<PathBuf> {
         out.truncate(config.limit);
     }
     out
+}
+
+/// Linked worktrees store a gitfile at `.git` (`gitdir: …`) instead of a
+/// directory. `ignore::WalkBuilder`'s default `require_git` + `git_exclude` +
+/// parent-ignore walk then treats the checkout as ignored and yields zero
+/// files. Honour this tree's `.gitignore` without requiring a `.git`
+/// directory, skip `info/exclude` (it lives in the main worktree), and do not
+/// inherit parent-repo ignore rules that often list the worktree path itself.
+fn walk_builder(dir: &Path, repo_root: &Path) -> WalkBuilder {
+    let mut builder = WalkBuilder::new(dir);
+    builder.filter_entry(|entry| {
+        entry
+            .file_name()
+            .to_str()
+            .is_none_or(|name| !SKIP_DIRS.contains(&name))
+    });
+    if repo_root.join(".git").is_file() || dir.join(".git").is_file() {
+        builder.require_git(false);
+        builder.git_exclude(false);
+        builder.parents(false);
+    }
+    builder
 }
 
 pub fn read_state(root: &Path, file: &Path) -> Result<FileState> {
@@ -334,5 +349,40 @@ mod tests {
         let files = collect_files(&config);
         assert!(files.iter().any(|f| f.ends_with("jev.rs")));
         assert!(!files.iter().any(|f| f.to_string_lossy().contains("target")));
+    }
+
+    fn scan_fixture(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("painpoints-scan-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_gitfile_at_the_root_does_not_hide_source_files() {
+        let dir = scan_fixture("gitfile");
+        std::fs::write(dir.join(".git"), "gitdir: /tmp/fake.git/worktrees/wt\n").unwrap();
+        std::fs::write(dir.join(".gitignore"), "skip_me.rs\n").unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn ok() {}\n").unwrap();
+        std::fs::write(dir.join("src/skip_me.rs"), "pub fn no() {}\n").unwrap();
+
+        let files = collect_files(&Config::new(dir.clone()));
+        assert!(
+            files.iter().any(|f| f.ends_with("lib.rs")),
+            "worktree with a .git file should still walk source files, got {files:?}"
+        );
+        assert!(
+            !files.iter().any(|f| f.ends_with("skip_me.rs")),
+            "local .gitignore should still apply when .git is a file, got {files:?}"
+        );
+
+        let mut included = Config::new(dir);
+        included.includes = vec!["src".into()];
+        let files = collect_files(&included);
+        assert!(
+            files.iter().any(|f| f.ends_with("lib.rs")),
+            "--include of a worktree subdir must see files, got {files:?}"
+        );
     }
 }
