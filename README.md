@@ -56,6 +56,7 @@ typed answers and calibrated probabilities rather than prose. See
 
 ```
 painpoints [TARGET] [options]
+painpoints compile [TARGET]
 painpoints mcp
 
   TARGET            a repository to classify, or a single source file
@@ -64,16 +65,22 @@ painpoints mcp
   --limit N         stop after N files
   --out DIR         where the report is written (default: ROOT/.painpoints)
   --headless        write the report without opening a window
-  --json            print the result to stdout as JSON
+  --json            print the result to stdout as JSON and write nothing else
   --refresh         reclassify everything instead of reusing the saved report
 
   compile [TARGET]  discover AGENTS.md and friends, write .painpoints/rules.json
+  --draft           after compile, print how to hand-edit model questions
   mcp               serve the Model Context Protocol on stdio
 ```
+
+`compile` does not call the model and does not need an API key. Classify loads
+`.painpoints/rules.json` (or compiles it if that file is missing or stale).
 
 It walks any language it recognises (TypeScript, JavaScript, Python, Go, Rust,
 Java, Kotlin, C#, PHP, Ruby, Swift, Scala, Elixir, Dart, Vue, Svelte, Astro,
 SQL), respects `.gitignore`, and skips vendored, generated and minified files.
+A git worktree whose `.git` is a file (not a directory) is scanned the same way
+as a normal checkout.
 
 ## What it scores
 
@@ -153,13 +160,20 @@ to browse the last result is free.
 ## Agent rules
 
 The six architecture dimensions are fixed. The target repository's own
-instruction files are not. painpoints discovers `AGENTS.md`, `AGENT.md`,
-`CLAUDE.md`, `AGENTS.txt`, `.cursorrules`, `.cursor/rules/**/*.{md,mdc}`,
-`.github/copilot-instructions.md`, `.claude/CLAUDE.md`, nested `AGENTS.md` /
-`CLAUDE.md` (scoped to that subtree), and pointer files that say "read X".
-It compiles those into a committed, hand-editable `.painpoints/rules.json`:
-sources with hashes, and rules bucketed as `lint`, `model`, `deferred` or
-`unenforceable`. There are no built-in extra rules.
+instruction files are not. `painpoints compile [TARGET]` discovers those files
+and writes a committed, hand-editable `.painpoints/rules.json`: sources with
+hashes, and rules bucketed as `lint`, `model`, `deferred` or `unenforceable`.
+There are no built-in extra rules.
+
+Sources, in the order they are found:
+
+- `AGENTS.md`, `AGENT.md`, `CLAUDE.md`, `AGENTS.txt`
+- `.cursorrules`, `.cursor/rules/**/*.{md,mdc}`
+- `.github/copilot-instructions.md`, `.claude/CLAUDE.md`
+- nested `AGENTS.md` / `CLAUDE.md` (scoped to that subtree)
+- pointer files that say "read X"
+
+Gitignored trees and `.claude/worktrees` / `.cursor/worktrees` are skipped.
 
 ```
 painpoints compile .
@@ -167,24 +181,32 @@ painpoints compile .
 
 Classify loads that file (or compiles it if it is missing or stale against
 source hashes). Active `model` rules whose `scope` matches the file become
-extra Jev questions on the same SystemOne call as the six dimensions.
-Violations land in `findings` next to architecture pain, as `rule:<id>`,
-quoting the instruction and pointing at `AGENTS.md:12`. Lint rules are
-recorded only. `when: turn` rules are kept in `rules.json` but not judged on a
-whole-file classify.
+extra Jev questions on the same SystemOne call as the six dimensions. They sit
+beside those dimensions, not in place of them: violations land in `findings`
+as `rule:<id>`, quoting the instruction and pointing at `AGENTS.md:12`.
+Architecture scores and ranking stay the same. Lint rules are recorded only.
+`when: turn` rules stay in `rules.json` but are not judged on a whole-file
+classify.
+
+Process and conversation rules (branch names, PR wording, worktrees, which
+model to use) compile as `unenforceable` and do not count against the
+model-rule caps. Path-scoped rules are preferred when picking the per-file
+question budget. Compile prints which sources were truncated instead of
+dropping them silently.
 
 The compile is deterministic: it extracts instruction sentences and scaffolds
-a choice question (true/false criteria, `violating: ["true"]`) per model rule.
-`--draft` prints how to hand-edit those questions so a violating file scores
-near 1 and a clean file near 0. Do not add rules the instruction files do not
-state.
+a TypeSafe `choice` question per model rule (true/false criteria,
+`violating: ["true"]`). SystemOne has no boolean type. `--draft` prints how to
+hand-edit those questions so a violating file scores near 1 and a clean file
+near 0. Do not add rules the instruction files do not state.
 
 ## For agents
 
-Three ways in, all sharing one cache. The repository also ships a Claude Code
-skill at `.claude/skills/painpoints/SKILL.md` that tells an agent when to reach
-for the tool, which entry point to pick, and how to read a result without
-over-claiming.
+Three ways in, all sharing one cache, plus `painpoints compile [TARGET]` to
+refresh `.painpoints/rules.json` without calling the model. The repository
+also ships a Claude Code skill at `.claude/skills/painpoints/SKILL.md` that
+tells an agent when to reach for the tool, which entry point to pick, and how
+to read a result without over-claiming.
 
 **One file, atomic.** Point it at a single file and get that file's result on
 stdout. Nothing else is read, nothing else is written.
