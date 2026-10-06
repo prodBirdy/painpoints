@@ -354,15 +354,51 @@ pub fn load_or_compile(root: &Path) -> Result<Option<RulesFile>> {
         return Ok(None);
     }
     let path = rules_path(root);
-    if let Some(existing) = load(&path) {
-        if !is_stale(&existing, &candidates, root) {
-            return Ok(Some(existing));
+    let existing = load(&path);
+    if let Some(existing) = &existing {
+        if !is_stale(existing, &candidates, root) {
+            return Ok(Some(existing.clone()));
         }
     }
-    let (compiled, notes) = compile_with_notes(root, &candidates);
+    let (mut compiled, notes) = compile_with_notes(root, &candidates);
+    if let Some(previous) = &existing {
+        carry_over(&mut compiled, previous);
+    }
     print_truncation(&notes);
     write(&path, &compiled)?;
     Ok(Some(compiled))
+}
+
+/// Recompiling after an instruction file changes must not throw away the
+/// questions someone refined by hand. A rule whose instruction text is still
+/// in the sources keeps its id, scope, phase, check and status from the
+/// previous file; a rule whose instruction was removed goes with it. The
+/// thresholds are kept too. Delete rules.json to start from scaffolds again.
+pub fn carry_over(fresh: &mut RulesFile, previous: &RulesFile) {
+    let mut used: HashSet<String> = HashSet::new();
+    for rule in &mut fresh.rules {
+        let Some(old) = previous
+            .rules
+            .iter()
+            .find(|old| same_rule(&old.text, &rule.text) && !used.contains(&old.id))
+        else {
+            continue;
+        };
+        used.insert(old.id.clone());
+        rule.id = old.id.clone();
+        rule.scope = old.scope.clone();
+        rule.when = old.when.clone();
+        rule.check = old.check.clone();
+        rule.status = old.status.clone();
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    for rule in &mut fresh.rules {
+        if !seen.insert(rule.id.clone()) {
+            rule.id = format!("{}-{}", rule.id, seen.len());
+            seen.insert(rule.id.clone());
+        }
+    }
+    fresh.thresholds = previous.thresholds;
 }
 
 pub fn discover(root: &Path) -> Vec<SourceCandidate> {
@@ -1716,11 +1752,14 @@ pub fn draft_notes(rules: &RulesFile, dest: &Path) -> String {
         "Agent rules written to {} ({} rules: {model} model, {lint} lint, {deferred} deferred, {unenforceable} unenforceable).\n\
          \n\
          The compile is deterministic: it extracts instruction sentences and scaffolds a choice\n\
-         Jev question (true/false criteria, violating: [\"true\"]) per model rule. To refine those\n\
-         questions, edit check.question on each model rule in that file. A violating file should\n\
-         score near 1 and a clean file near 0. Keep instructions under 60 words. Ask about\n\
-         existence in this file, not a judgment of the whole. Do not add rules the instruction\n\
-         files do not state.",
+         question (true/false criteria, violating: [\"true\"]) per model rule. Scaffolds restate\n\
+         the rule and rarely separate violating files from clean ones. Refine them by editing\n\
+         scope and check.question on each model rule: ask whether there is at least one concrete\n\
+         offending construct, put a violating and a compliant example in the repository's own\n\
+         idiom in criteria, scope the rule to the paths it is about, and keep instructions under\n\
+         60 words. The painpoints-rules skill describes the method and how to test a rule.\n\
+         Edits survive recompiles while the instruction text stays. Do not add rules the\n\
+         instruction files do not state.",
         dest.display(),
         rules.rules.len()
     )
@@ -2292,5 +2331,75 @@ mod tests {
         let picked = file.model_rules_for("src/lib.rs");
         assert_eq!(picked.len(), MAX_RULE_QUESTIONS);
         assert_eq!(picked[0].id, "thin-handlers");
+    }
+
+    #[test]
+    fn a_recompile_keeps_hand_edited_rules_and_drops_removed_ones() {
+        let root = fixture("carry-over");
+        write_tree(
+            &root,
+            &[(
+                "AGENTS.md",
+                "# Rules\n\n- Never show a user a raw error.\n- Keep handlers thin and delegate to services.\n",
+            )],
+        );
+        let (mut first, _) = compile_with_notes(&root, &discover(&root));
+        let raw = first
+            .rules
+            .iter_mut()
+            .find(|r| r.text.contains("raw error"))
+            .expect("raw error rule");
+        raw.id = "no-raw-error".into();
+        raw.scope = Some(vec!["server/**/*.ts".into()]);
+        raw.check = Check::Model {
+            question: Question::Choice {
+                instructions: "Is there at least one response that includes error.message?".into(),
+                criteria: BTreeMap::from([
+                    (
+                        "true".into(),
+                        "c.json({ error: error.message }, 500)".into(),
+                    ),
+                    (
+                        "false".into(),
+                        "c.json({ error: 'Try again.' }, 500)".into(),
+                    ),
+                ]),
+                violating: vec!["true".into()],
+            },
+            overlaps: None,
+        };
+        first.thresholds = Some(Thresholds {
+            act: 0.7,
+            flag: 0.4,
+        });
+        let edited = first
+            .rules
+            .iter()
+            .find(|r| r.id == "no-raw-error")
+            .cloned()
+            .unwrap();
+
+        write_tree(
+            &root,
+            &[(
+                "AGENTS.md",
+                "# Rules\n\n- Never show a user a raw error.\n- Use `type`, never `interface`.\n",
+            )],
+        );
+        let (mut second, _) = compile_with_notes(&root, &discover(&root));
+        carry_over(&mut second, &first);
+        let kept = second
+            .rules
+            .iter()
+            .find(|r| r.id == "no-raw-error")
+            .expect("kept");
+        assert_eq!(kept.check, edited.check);
+        assert_eq!(kept.scope, edited.scope);
+        assert!(second
+            .rules
+            .iter()
+            .all(|r| !r.text.contains("handlers thin")));
+        assert!(second.rules.iter().any(|r| r.text.contains("interface")));
+        assert_eq!(second.thresholds, first.thresholds);
     }
 }

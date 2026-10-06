@@ -91,7 +91,10 @@ fn compile_cmd() -> Result<()> {
         eprintln!("found 0 instruction files under {}", root.display());
         return Ok(());
     }
-    let (compiled, notes) = rules::compile_with_notes(&root, &candidates);
+    let (mut compiled, notes) = rules::compile_with_notes(&root, &candidates);
+    if let Some(previous) = rules::load(&dest) {
+        rules::carry_over(&mut compiled, &previous);
+    }
     rules::write(&dest, &compiled)?;
     let (model, lint, deferred, unenforceable) = compiled.bucket_counts();
     eprintln!(

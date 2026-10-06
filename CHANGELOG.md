@@ -46,6 +46,20 @@ decisions instead of only scoring how much of a quality a file has.
 - The Markdown report's file table no longer ends its separator row with an
   extra `|`.
 
+### Rules
+
+- Recompiling after an instruction file changes keeps hand-edited rules:
+  every rule whose instruction text is still in the sources keeps its id,
+  scope, phase, question and status, and `thresholds` are kept. Before, any
+  change to `AGENTS.md` silently replaced the whole file with fresh
+  scaffolds.
+- A single-file `--json` result and `painpoints_file` include every
+  `decisions` and `rule_verdicts` entry with its probability, so a rewritten
+  rule can be tested on a violating and a compliant file.
+- New `painpoints-rules` skill: how to bucket, scope, phrase and test rule
+  questions for a System One model, from what `painpoints eval` and a real
+  run measured.
+
 ## 0.2.0 — 2026-09-19
 
 Minor release: compile the target repository's own agent-instruction files

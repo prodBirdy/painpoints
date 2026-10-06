@@ -280,17 +280,32 @@ rank files or appear in findings until the question is rewritten or scoped.
 The compile is deterministic: it extracts instruction sentences and scaffolds
 a `choice` question per model rule (true/false criteria,
 `violating: ["true"]`), sent as `rule.<id>` because Clef only accepts question
-names made of letters, digits, `_`, `.` and `-`. `--draft` prints how to
-hand-edit those questions so a violating file scores near 1 and a clean file
-near 0. Do not add rules the instruction files do not state.
+names made of letters, digits, `_`, `.` and `-`. Scaffolds restate the
+rule and rarely separate violating files from clean ones, so refine them by
+hand or with the `painpoints-rules` skill: ask whether a concrete construct
+exists, give a violating and a compliant example in the codebase's own idiom,
+and scope the rule to the paths it is about. `--draft` prints a short version
+of that guidance. A single-file `--json` result lists every rule's
+`probability` under `rule_verdicts`, which is how a rewritten question is
+tested.
+
+Hand edits survive recompiles: when an instruction file changes, every rule
+whose instruction text is still there keeps its id, `scope`, `when`, `status`
+and question, and `thresholds` are kept. Rules whose instruction was removed
+go with it. Delete `rules.json` to start from scaffolds. Do not add rules the
+instruction files do not state.
 
 ## For agents
 
 Three ways in, all sharing one cache, plus `painpoints compile [TARGET]` to
 refresh `.painpoints/rules.json` without calling the model. The repository
-also ships a Claude Code skill at `.claude/skills/painpoints/SKILL.md` that
-tells an agent when to reach for the tool, which entry point to pick, and how
-to read a result without over-claiming.
+also ships two Claude Code skills. `.claude/skills/painpoints/SKILL.md` tells
+an agent when to reach for the tool, which entry point to pick, and how to
+read a result without over-claiming. `.claude/skills/painpoints-rules/SKILL.md`
+teaches it to turn the compiled scaffolds in `rules.json` into questions a
+System One model answers well, and to test each one on a violating and a
+compliant file. Copy either into `~/.claude/skills/` to use it in every
+repository.
 
 **One file, atomic.** Point it at a single file and get that file's result on
 stdout. Nothing else is read, nothing else is written.

@@ -93,6 +93,8 @@ pub fn file_result(record: &Record, cached: bool) -> Value {
         "is_pain_point": record.is_pain_point(),
         "pain_threshold": PAIN_THRESHOLD,
         "findings": findings(record),
+        "decisions": record.decisions,
+        "rule_verdicts": record.rule_verdicts,
         "cached": cached,
         "model": model(),
     })

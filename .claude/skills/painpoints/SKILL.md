@@ -75,6 +75,7 @@ friends without calling the model.
 - `summary.noisy_rules` lists compiled agent rules that misfired on most
   files. Their verdicts are ignored; suggest rewriting or scoping them in
   `.painpoints/rules.json` rather than reporting them as violations.
+  The `painpoints-rules` skill covers how to rewrite, scope and test them.
 - `summary.by_role` shows where the pain lives structurally, for example
   `api-surface` handlers scoring high on `boundary_leak` means business rules
   sit in route handlers.
