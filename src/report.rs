@@ -151,7 +151,10 @@ impl Report {
         );
 
         let _ = writeln!(out, "## Dimensions\n");
-        let _ = writeln!(out, "| dimension | files at {PAIN_THRESHOLD:.1} or above | standard |");
+        let _ = writeln!(
+            out,
+            "| dimension | files at {PAIN_THRESHOLD:.1} or above | standard |"
+        );
         let _ = writeln!(out, "| --- | --- | --- |");
         for dimension in DIMENSIONS {
             let hits = self
@@ -174,11 +177,7 @@ impl Report {
             "| file | role | worst | score | {} |",
             columns.join(" | ")
         );
-        let _ = writeln!(
-            out,
-            "|{}|",
-            " --- |".repeat(4 + columns.len())
-        );
+        let _ = writeln!(out, "|{}|", " --- |".repeat(4 + columns.len()));
         for record in ranked.iter().take(TOP_FILES) {
             let s = &record.scores;
             let _ = writeln!(
@@ -222,7 +221,11 @@ impl Report {
                 );
             }
             if hits.len() > PER_DIMENSION {
-                let _ = writeln!(out, "- and {} more in the JSON report", hits.len() - PER_DIMENSION);
+                let _ = writeln!(
+                    out,
+                    "- and {} more in the JSON report",
+                    hits.len() - PER_DIMENSION
+                );
             }
         }
 
@@ -246,7 +249,10 @@ impl Report {
                 "These files break a model rule compiled from the repository's own instruction files into `.painpoints/rules.json`.\n"
             );
             for (path, rule, probability, source) in rule_hits.iter().take(PER_DIMENSION) {
-                let _ = writeln!(out, "- `{path}` `{rule}` ({probability:.2}) from `{source}`");
+                let _ = writeln!(
+                    out,
+                    "- `{path}` `{rule}` ({probability:.2}) from `{source}`"
+                );
             }
         }
 

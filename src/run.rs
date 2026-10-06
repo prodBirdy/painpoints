@@ -69,6 +69,8 @@ pub fn blocking(
         }
     }
 
-    outcome.records.sort_by(|a, b| a.rank_key().cmp(&b.rank_key()));
+    outcome
+        .records
+        .sort_by(|a, b| a.rank_key().cmp(&b.rank_key()));
     Ok(outcome)
 }

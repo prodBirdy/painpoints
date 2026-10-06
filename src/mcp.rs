@@ -91,7 +91,10 @@ fn classify_file(args: &Value) -> Result<Value> {
     let config = Config::single(file);
     let root = config.root.clone();
     let dir = out_dir(&root);
-    let refresh = args.get("refresh").and_then(Value::as_bool).unwrap_or(false);
+    let refresh = args
+        .get("refresh")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let cache = if refresh {
         Default::default()
     } else {
@@ -134,7 +137,10 @@ fn classify_repo(args: &Value) -> Result<Value> {
     config.limit = args.get("limit").and_then(Value::as_u64).unwrap_or(0) as usize;
 
     let dir = out_dir(&root);
-    let refresh = args.get("refresh").and_then(Value::as_bool).unwrap_or(false);
+    let refresh = args
+        .get("refresh")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let cache = if refresh {
         Default::default()
     } else {
@@ -241,7 +247,10 @@ fn failed(id: Value, code: i32, message: String) -> Value {
 
 fn call(id: Value, params: &Value) -> Value {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-    let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let args = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     let outcome = match name {
         "painpoints_file" => classify_file(&args),
         "painpoints_repo" => classify_repo(&args),
@@ -384,7 +393,10 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0]["dimension"], "rule:no-raw-error");
         assert_eq!(found[0]["kind"], "rule");
-        assert!(found[0]["description"].as_str().unwrap().contains("raw error"));
+        assert!(found[0]["description"]
+            .as_str()
+            .unwrap()
+            .contains("raw error"));
         assert_eq!(found[0]["source"], "AGENTS.md:4");
         assert_eq!(found[0]["url"], "");
         let value = file_result(&record_with_rule(), false);

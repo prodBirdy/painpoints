@@ -1560,27 +1560,26 @@ pub fn violation_probability(question: &Question, answer: &Value) -> (f32, Optio
                 };
                 return (p, Some(choice.to_string()));
             }
-            let p = answer
-                .get("probability")
-                .and_then(Value::as_f64)
-                .or_else(|| {
-                    answer.get("boolean").and_then(Value::as_bool).map(
-                        |b| {
+            let p =
+                answer
+                    .get("probability")
+                    .and_then(Value::as_f64)
+                    .or_else(|| {
+                        answer.get("boolean").and_then(Value::as_bool).map(|b| {
                             if b {
                                 1.0
                             } else {
                                 0.0
                             }
-                        },
-                    )
-                })
-                .or_else(|| {
-                    answer
-                        .get("answer")
-                        .and_then(Value::as_bool)
-                        .map(|b| if b { 1.0 } else { 0.0 })
-                })
-                .unwrap_or(0.0) as f32;
+                        })
+                    })
+                    .or_else(|| {
+                        answer
+                            .get("answer")
+                            .and_then(Value::as_bool)
+                            .map(|b| if b { 1.0 } else { 0.0 })
+                    })
+                    .unwrap_or(0.0) as f32;
             (p.clamp(0.0, 1.0), None)
         }
         Question::Choice { violating, .. } => {

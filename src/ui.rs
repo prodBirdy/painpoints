@@ -363,7 +363,10 @@ impl PainPoints {
                     .when(spent, |el| {
                         el.child(stat(
                             "TOKENS",
-                            format!("{} in / {} out", self.usage.input_tokens, self.usage.output_tokens),
+                            format!(
+                                "{} in / {} out",
+                                self.usage.input_tokens, self.usage.output_tokens
+                            ),
                         ))
                     })
                     .child(
@@ -544,18 +547,16 @@ impl PainPoints {
             .py(px(14.));
 
         let Some(record) = self.current() else {
-            let mut summary = panel
-                .child(label("THIS REPOSITORY"))
-                .child(
-                    div()
-                        .text_size(px(13.))
-                        .text_color(rgb(TEXT))
-                        .child(format!(
-                            "{} of {} files carry a pain point",
-                            self.pain_points(),
-                            self.records.len()
-                        )),
-                );
+            let mut summary = panel.child(label("THIS REPOSITORY")).child(
+                div()
+                    .text_size(px(13.))
+                    .text_color(rgb(TEXT))
+                    .child(format!(
+                        "{} of {} files carry a pain point",
+                        self.pain_points(),
+                        self.records.len()
+                    )),
+            );
             for dimension in DIMENSIONS {
                 let count = self.hits(dimension.key);
                 summary = summary.child(
@@ -843,28 +844,36 @@ impl Render for PainPoints {
                                     uniform_list(
                                         "records",
                                         count,
-                                        cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
-                                            range
-                                                .map(|i| {
-                                                    let record = &visible[i];
-                                                    let path = record.path.clone();
-                                                    let chosen =
-                                                        this.selected.as_deref() == Some(path.as_str());
-                                                    row(i, record, chosen)
-                                                        .on_click(cx.listener(move |this, _event, _window, cx| {
-                                                            this.selected = if this.selected.as_deref()
-                                                                == Some(path.as_str())
-                                                            {
-                                                                None
-                                                            } else {
-                                                                Some(path.clone())
-                                                            };
-                                                            cx.notify();
-                                                        }))
-                                                        .into_any_element()
-                                                })
-                                                .collect()
-                                        }),
+                                        cx.processor(
+                                            move |this,
+                                                  range: std::ops::Range<usize>,
+                                                  _window,
+                                                  cx| {
+                                                range
+                                                    .map(|i| {
+                                                        let record = &visible[i];
+                                                        let path = record.path.clone();
+                                                        let chosen = this.selected.as_deref()
+                                                            == Some(path.as_str());
+                                                        row(i, record, chosen)
+                                                            .on_click(cx.listener(
+                                                                move |this, _event, _window, cx| {
+                                                                    this.selected =
+                                                                        if this.selected.as_deref()
+                                                                            == Some(path.as_str())
+                                                                        {
+                                                                            None
+                                                                        } else {
+                                                                            Some(path.clone())
+                                                                        };
+                                                                    cx.notify();
+                                                                },
+                                                            ))
+                                                            .into_any_element()
+                                                    })
+                                                    .collect()
+                                            },
+                                        ),
                                     )
                                     .flex_grow(),
                                 )
