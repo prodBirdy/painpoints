@@ -1,3 +1,4 @@
+use crate::decisions::{self, Decision};
 use crate::rules::{self, RuleVerdict, RulesFile};
 use anyhow::{bail, Context as _, Result};
 use serde::{Deserialize, Serialize};
@@ -9,22 +10,115 @@ use std::sync::LazyLock;
 pub const DEFAULT_MODEL: &str = "jev-latest";
 pub const DEFAULT_BASE_URL: &str = "https://api.typesafe.ai";
 const SYSTEM_ONE_PATH: &str = "/v1/systemone";
+pub const CLOUDFLARE_DEFAULT_MODEL: &str = "clef-flash";
+pub const CLOUDFLARE_BASE_URL: &str = "https://api.cloudflare.com/client/v4";
 
-fn setting(name: &str, fallback: &str) -> String {
+/// Every provider speaks the System One request shape (`model`, `state`,
+/// `questions` in, `answers` out); only the address, the credential and the
+/// model name differ.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Provider {
+    TypeSafe,
+    Cloudflare,
+}
+
+fn env(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| fallback.to_string())
 }
 
+fn setting(name: &str, fallback: &str) -> String {
+    env(name).unwrap_or_else(|| fallback.to_string())
+}
+
+/// `PAINPOINTS_PROVIDER` wins; otherwise whichever credential is present,
+/// TypeSafe first so existing setups keep their behaviour.
+pub fn provider() -> Provider {
+    match env("PAINPOINTS_PROVIDER")
+        .map(|p| p.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("cloudflare") | Some("clef") => Provider::Cloudflare,
+        Some(_) => Provider::TypeSafe,
+        None if env("TYPESAFE_API_KEY").is_none() && env("CLOUDFLARE_API_TOKEN").is_some() => {
+            Provider::Cloudflare
+        }
+        None => Provider::TypeSafe,
+    }
+}
+
+fn configured_model(provider: Provider) -> String {
+    match provider {
+        Provider::TypeSafe => env("PAINPOINTS_MODEL")
+            .unwrap_or_else(|| setting("TYPESAFE_DEFAULT_MODEL", DEFAULT_MODEL)),
+        Provider::Cloudflare => setting("PAINPOINTS_MODEL", CLOUDFLARE_DEFAULT_MODEL),
+    }
+}
+
+/// `clef-flash` or a full Workers AI id such as `@cf/cloudflare/clef-flash`;
+/// the request body wants the bare name.
+fn body_model(model: &str) -> &str {
+    model.rsplit('/').next().unwrap_or(model)
+}
+
+/// A larger model that re-answers only the detector questions the main model
+/// was unsure about. `PAINPOINTS_CONFIRM_MODEL` sets it, `none` turns it off;
+/// on Cloudflare it defaults to Clef behind Clef-flash, because Clef-flash
+/// misses real bad decisions that Clef catches while the cascade costs a
+/// fraction of running Clef on everything.
+pub fn confirm_model() -> Option<String> {
+    let provider = provider();
+    match env("PAINPOINTS_CONFIRM_MODEL") {
+        Some(m) if m.eq_ignore_ascii_case("none") || m.eq_ignore_ascii_case("off") => None,
+        Some(m) => Some(m),
+        None if provider == Provider::Cloudflare
+            && body_model(&configured_model(provider)) == CLOUDFLARE_DEFAULT_MODEL =>
+        {
+            Some("clef".into())
+        }
+        None => None,
+    }
+}
+
+/// The name reports and the cache digest record. Cloudflare models carry a
+/// prefix so a Clef report is never reused as a Jev one, and a confirming
+/// model is part of the name because it changes the answers.
 pub fn model() -> String {
-    setting("TYPESAFE_DEFAULT_MODEL", DEFAULT_MODEL)
+    let provider = provider();
+    let model = configured_model(provider);
+    let name = match provider {
+        Provider::TypeSafe => model,
+        Provider::Cloudflare => format!("cloudflare/{}", body_model(&model)),
+    };
+    match confirm_model() {
+        Some(confirm) => format!("{name}+{}", body_model(&confirm)),
+        None => name,
+    }
 }
 
-pub fn endpoint() -> String {
-    let base = setting("TYPESAFE_BASE_URL", DEFAULT_BASE_URL);
+pub fn provider_label() -> &'static str {
+    match provider() {
+        Provider::TypeSafe => "TypeSafe",
+        Provider::Cloudflare => "Cloudflare Workers AI",
+    }
+}
+
+fn typesafe_endpoint(base: &str) -> String {
     format!("{}{SYSTEM_ONE_PATH}", base.trim_end_matches('/'))
+}
+
+fn cloudflare_endpoint(base: &str, account: &str, model: &str) -> String {
+    let id = if model.starts_with('@') {
+        model.to_string()
+    } else {
+        format!("@cf/cloudflare/{model}")
+    };
+    format!(
+        "{}/accounts/{account}/ai/run/{id}",
+        base.trim_end_matches('/')
+    )
 }
 
 pub struct Dimension {
@@ -176,6 +270,9 @@ pub static QUESTIONS: LazyLock<Value> = LazyLock::new(|| {
             }),
         );
     }
+    for detector in &decisions::DETECTORS {
+        map.insert(decisions::key(detector.id), decisions::question(detector));
+    }
     questions
 });
 
@@ -185,16 +282,22 @@ static QUESTIONS_DIGEST: LazyLock<u64> = LazyLock::new(|| {
     hasher.finish()
 });
 
-pub fn digest(state: &FileState, agent_rules: Option<&RulesFile>) -> String {
+pub fn digest(windows: &[FileState], agent_rules: Option<&RulesFile>) -> String {
     let mut hasher = DefaultHasher::new();
     QUESTIONS_DIGEST.hash(&mut hasher);
     model().hash(&mut hasher);
-    state.path.hash(&mut hasher);
-    state.lines.hash(&mut hasher);
-    state.truncated.hash(&mut hasher);
-    state.source.hash(&mut hasher);
-    if let Some(applied) = agent_rules
-        .map(|r| r.applied_digest(&state.path))
+    for state in windows {
+        state.path.hash(&mut hasher);
+        state.lines.hash(&mut hasher);
+        state.start_line.hash(&mut hasher);
+        state.end_line.hash(&mut hasher);
+        state.truncated.hash(&mut hasher);
+        state.source.hash(&mut hasher);
+    }
+    if let Some(applied) = windows
+        .first()
+        .zip(agent_rules)
+        .map(|(state, r)| r.applied_digest(&state.path))
         .filter(|d| !d.is_empty())
     {
         applied.hash(&mut hasher);
@@ -202,18 +305,24 @@ pub fn digest(state: &FileState, agent_rules: Option<&RulesFile>) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-pub fn questions_for(state: &FileState, agent_rules: Option<&RulesFile>) -> Value {
+pub fn questions_for(path: &str, agent_rules: Option<&RulesFile>) -> Value {
     let Some(agent_rules) = agent_rules else {
         return QUESTIONS.clone();
     };
-    rules::questions_for_rules(QUESTIONS.clone(), &agent_rules.model_rules_for(&state.path))
+    rules::questions_for_rules(QUESTIONS.clone(), &agent_rules.model_rules_for(path))
 }
 
+/// One window of a source file as the model sees it. Files longer than one
+/// window are read as several overlapping windows; `start_line` and
+/// `end_line` say which part this is, and `truncated` marks the last window
+/// when the file goes on past the window budget.
 #[derive(Debug, Clone, Serialize)]
 pub struct FileState {
     pub path: String,
     pub language: String,
     pub lines: usize,
+    pub start_line: usize,
+    pub end_line: usize,
     pub truncated: bool,
     pub source: String,
 }
@@ -242,12 +351,47 @@ pub struct Answers {
     pub trust_boundary_risk: ScoreAnswer,
 }
 
+fn worse(a: ScoreAnswer, b: ScoreAnswer) -> ScoreAnswer {
+    if b.score > a.score {
+        b
+    } else {
+        a
+    }
+}
+
+impl Answers {
+    /// A file is as painful as its worst window; the role comes from the
+    /// window that was surest about it.
+    fn fold(self, other: Answers) -> Answers {
+        Answers {
+            role: if other.role.confidence > self.role.confidence {
+                other.role
+            } else {
+                self.role
+            },
+            boundary_leak: worse(self.boundary_leak, other.boundary_leak),
+            complexity: worse(self.complexity, other.complexity),
+            data_access_cost: worse(self.data_access_cost, other.data_access_cost),
+            failure_handling: worse(self.failure_handling, other.failure_handling),
+            interaction_cost: worse(self.interaction_cost, other.interaction_cost),
+            trust_boundary_risk: worse(self.trust_boundary_risk, other.trust_boundary_risk),
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize, Serialize, Clone, Copy)]
 pub struct Usage {
     #[serde(default)]
     pub input_tokens: u64,
     #[serde(default)]
     pub output_tokens: u64,
+}
+
+impl Usage {
+    pub fn add(&mut self, other: Usage) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+    }
 }
 
 fn round2<S: serde::Serializer>(value: &f32, serializer: S) -> Result<S::Ok, S::Error> {
@@ -307,12 +451,26 @@ pub struct Record {
     pub needs_review: bool,
     pub digest: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decisions: Vec<Decision>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rule_verdicts: Vec<RuleVerdict>,
 }
 
 impl Record {
-    pub fn rank_key(&self) -> (i32, i32, &str) {
+    /// Confirmed bad decisions and rule violations rank a file above any
+    /// score, because they name something specific to fix.
+    pub fn acted(&self) -> usize {
+        self.decisions.iter().filter(|d| d.band == "act").count()
+            + self
+                .rule_verdicts
+                .iter()
+                .filter(|v| v.band == "act")
+                .count()
+    }
+
+    pub fn rank_key(&self) -> (i32, i32, i32, &str) {
         (
+            -(self.acted() as i32),
             -(self.worst_score * 1000.0) as i32,
             -(self.total_score * 1000.0) as i32,
             self.path.as_str(),
@@ -322,6 +480,52 @@ impl Record {
     pub fn has_rule_violation(&self) -> bool {
         self.rule_verdicts.iter().any(|v| v.band == "act")
     }
+
+    pub fn has_bad_decision(&self) -> bool {
+        self.decisions.iter().any(|d| d.band == "act")
+    }
+
+    pub fn is_pain_point(&self) -> bool {
+        self.worst_score >= PAIN_THRESHOLD || self.has_rule_violation() || self.has_bad_decision()
+    }
+}
+
+/// A rule needs to have been asked on this many files before its hit rate
+/// says anything about the rule rather than about the files.
+pub const NOISY_MIN_FILES: usize = 10;
+
+/// A compiled rule that "fails" on half or more of the files it is asked
+/// about is almost always a question the files cannot answer (a table row,
+/// a rule about another app in the same repository), not a repository that
+/// breaks its own rule everywhere. Its violations are banded `noisy` so they
+/// stop ranking files and filling findings, and the rule is named so someone
+/// can rewrite or scope it in rules.json. Recomputed over the whole report,
+/// so a rule that stops misfiring gets its `act` verdicts back.
+pub fn mark_noisy_rules(records: &mut [Record]) -> Vec<String> {
+    let mut asked: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
+    for record in records.iter() {
+        for verdict in &record.rule_verdicts {
+            let entry = asked.entry(verdict.rule_id.clone()).or_default();
+            entry.0 += 1;
+            entry.1 += usize::from(verdict.band == "act" || verdict.band == "noisy");
+        }
+    }
+    let noisy: Vec<String> = asked
+        .into_iter()
+        .filter(|(_, (files, hits))| *files >= NOISY_MIN_FILES && hits * 2 >= *files)
+        .map(|(id, _)| id)
+        .collect();
+    for record in records.iter_mut() {
+        for verdict in &mut record.rule_verdicts {
+            let is_noisy = noisy.contains(&verdict.rule_id);
+            if is_noisy && verdict.band == "act" {
+                verdict.band = "noisy".into();
+            } else if !is_noisy && verdict.band == "noisy" {
+                verdict.band = "act".into();
+            }
+        }
+    }
+    noisy
 }
 
 pub fn to_record(state: &FileState, answers: &Answers) -> Record {
@@ -367,25 +571,150 @@ pub fn to_record(state: &FileState, answers: &Answers) -> Record {
         worst_score: worst.1,
         total_score: values.iter().sum(),
         needs_review: answers.role.confidence < 0.6 || shaky_score,
-        digest: digest(state, None),
+        digest: digest(std::slice::from_ref(state), None),
         scores,
+        decisions: Vec::new(),
         rule_verdicts: Vec::new(),
     }
+}
+
+/// Folds the raw answers for every window of one file into one record: the
+/// worst score per dimension, and for each detector and rule the window
+/// where it was most likely, with that window's lines when there was more
+/// than one.
+pub fn merge(
+    windows: &[FileState],
+    answers: &[Value],
+    agent_rules: Option<&RulesFile>,
+) -> Result<Record> {
+    let Some(first) = windows.first() else {
+        bail!("no windows to merge");
+    };
+    let mut folded: Option<Answers> = None;
+    for raw in answers {
+        let parsed: Answers = serde_json::from_value(raw.clone()).context("System One answers")?;
+        folded = Some(match folded {
+            None => parsed,
+            Some(prev) => prev.fold(parsed),
+        });
+    }
+    let Some(folded) = folded else {
+        bail!("no answers for {}", first.path);
+    };
+    let mut record = to_record(first, &folded);
+    record.digest = digest(windows, agent_rules);
+    let located =
+        |i: usize| (windows.len() > 1).then(|| [windows[i].start_line, windows[i].end_line]);
+
+    for detector in &decisions::DETECTORS {
+        let key = decisions::key(detector.id);
+        let best = answers
+            .iter()
+            .enumerate()
+            .filter_map(|(i, raw)| {
+                raw.get(&key)
+                    .and_then(decisions::yes_probability)
+                    .map(|p| (i, p))
+            })
+            .max_by(|a, b| a.1.total_cmp(&b.1));
+        if let Some((i, probability)) = best {
+            let confirmed_by = answers[i][&key]
+                .get("confirmed_by")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            record.decisions.push(Decision {
+                id: detector.id.to_string(),
+                dimension: detector.dimension.to_string(),
+                label: detector.label.to_string(),
+                probability,
+                band: decisions::band_for(probability).to_string(),
+                lines: located(i),
+                confirmed_by,
+            });
+        }
+    }
+    record
+        .decisions
+        .sort_by(|a, b| b.probability.total_cmp(&a.probability));
+
+    if let Some(agent_rules) = agent_rules {
+        let matching = agent_rules.model_rules_for(&first.path);
+        let mut best: Vec<RuleVerdict> = Vec::new();
+        for (i, raw) in answers.iter().enumerate() {
+            for mut verdict in
+                rules::verdicts_from_answers(raw, &matching, agent_rules.thresholds())
+            {
+                verdict.lines = located(i);
+                match best.iter_mut().find(|v| v.rule_id == verdict.rule_id) {
+                    Some(seen) if seen.probability >= verdict.probability => {}
+                    Some(seen) => *seen = verdict,
+                    None => best.push(verdict),
+                }
+            }
+        }
+        best.sort_by(|a, b| b.probability.total_cmp(&a.probability));
+        record.rule_verdicts = best;
+    }
+    if record.decisions.iter().any(|d| d.band == "flag")
+        || record.rule_verdicts.iter().any(|v| v.band == "flag")
+    {
+        record.needs_review = true;
+    }
+    Ok(record)
+}
+
+/// Below this a detector answer is trusted as a no; at or above it the
+/// confirming model is asked again.
+pub const CONFIRM_FROM: f32 = 0.3;
+
+struct Target {
+    model: String,
+    endpoint: String,
 }
 
 pub struct Client {
     http: reqwest::Client,
     key: String,
-    model: String,
-    endpoint: String,
+    main: Target,
+    confirm: Option<Target>,
 }
 
 impl Client {
     pub fn new() -> Result<Self> {
-        let key = std::env::var("TYPESAFE_API_KEY")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .context("TYPESAFE_API_KEY is not set; create one at https://typesafe.ai, or set TYPESAFE_BASE_URL to a gateway and pass its token as the key")?;
+        let provider = provider();
+        let model = configured_model(provider);
+        let confirm = confirm_model();
+        let (key, endpoint, confirm_endpoint) = match provider {
+            Provider::TypeSafe => (
+                env("TYPESAFE_API_KEY").context(
+                    "TYPESAFE_API_KEY is not set; create one at https://typesafe.ai, or set \
+                     TYPESAFE_BASE_URL to a gateway and pass its token as the key. To use \
+                     Cloudflare's Clef instead, set CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID",
+                )?,
+                typesafe_endpoint(&setting("TYPESAFE_BASE_URL", DEFAULT_BASE_URL)),
+                confirm
+                    .as_ref()
+                    .map(|_| typesafe_endpoint(&setting("TYPESAFE_BASE_URL", DEFAULT_BASE_URL))),
+            ),
+            Provider::Cloudflare => {
+                let token = env("CLOUDFLARE_API_TOKEN").context(
+                    "CLOUDFLARE_API_TOKEN is not set; create an API token with the Workers AI \
+                     permission in the Cloudflare dashboard",
+                )?;
+                let account = env("CLOUDFLARE_ACCOUNT_ID").context(
+                    "CLOUDFLARE_ACCOUNT_ID is not set; `cf auth whoami` or the Workers AI page \
+                     of the Cloudflare dashboard shows it",
+                )?;
+                let base = setting("CLOUDFLARE_BASE_URL", CLOUDFLARE_BASE_URL);
+                (
+                    token,
+                    cloudflare_endpoint(&base, &account, &model),
+                    confirm
+                        .as_ref()
+                        .map(|m| cloudflare_endpoint(&base, &account, m)),
+                )
+            }
+        };
         let http = reqwest::Client::builder()
             .pool_max_idle_per_host(32)
             .timeout(std::time::Duration::from_secs(90))
@@ -393,50 +722,36 @@ impl Client {
         Ok(Self {
             http,
             key,
-            model: model(),
-            endpoint: endpoint(),
+            main: Target {
+                model: body_model(&model).to_string(),
+                endpoint,
+            },
+            confirm: confirm.zip(confirm_endpoint).map(|(m, endpoint)| Target {
+                model: body_model(&m).to_string(),
+                endpoint,
+            }),
         })
     }
 
-    pub async fn classify(
+    async fn ask(
         &self,
+        target: &Target,
         state: &FileState,
-        agent_rules: Option<&RulesFile>,
-    ) -> Result<(Record, Usage)> {
-        let questions = questions_for(state, agent_rules);
-        let body = json!({ "model": self.model, "state": state, "questions": questions });
+        questions: &Value,
+    ) -> Result<(Value, Usage)> {
+        let body = json!({ "model": target.model, "state": state, "questions": questions });
         let mut backoff = std::time::Duration::from_millis(500);
         for attempt in 0..4 {
             let res = self
                 .http
-                .post(&self.endpoint)
+                .post(&target.endpoint)
                 .bearer_auth(&self.key)
                 .json(&body)
                 .send()
                 .await?;
             let status = res.status();
             if status.is_success() {
-                let parsed: Value = res.json().await?;
-                let answers: Answers = serde_json::from_value(parsed["answers"].clone())
-                    .context("SystemOne answers")?;
-                let usage: Usage = parsed
-                    .get("usage")
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or_default();
-                let mut record = to_record(state, &answers);
-                record.digest = digest(state, agent_rules);
-                if let Some(agent_rules) = agent_rules {
-                    let matching = agent_rules.model_rules_for(&state.path);
-                    record.rule_verdicts = rules::verdicts_from_answers(
-                        &parsed["answers"],
-                        &matching,
-                        agent_rules.thresholds(),
-                    );
-                    if record.rule_verdicts.iter().any(|v| v.band == "flag") {
-                        record.needs_review = true;
-                    }
-                }
-                return Ok((record, usage));
+                return parse_response(res.json().await?);
             }
             let retryable = status.as_u16() == 429 || status.is_server_error();
             if !retryable || attempt == 3 {
@@ -448,6 +763,93 @@ impl Client {
         }
         unreachable!()
     }
+
+    pub async fn classify(
+        &self,
+        windows: &[FileState],
+        agent_rules: Option<&RulesFile>,
+    ) -> Result<(Record, Usage)> {
+        let Some(first) = windows.first() else {
+            bail!("nothing to classify");
+        };
+        let questions = questions_for(&first.path, agent_rules);
+        let replies = futures::future::try_join_all(
+            windows.iter().map(|w| self.ask(&self.main, w, &questions)),
+        )
+        .await?;
+        let mut usage = Usage::default();
+        let mut answers = Vec::with_capacity(replies.len());
+        for (raw, used) in replies {
+            usage.add(used);
+            answers.push(raw);
+        }
+        if let Some(confirm) = &self.confirm {
+            usage.add(self.confirm_unsure(confirm, windows, &mut answers).await?);
+        }
+        Ok((merge(windows, &answers, agent_rules)?, usage))
+    }
+
+    /// Re-asks the confirming model only the detector questions each window
+    /// answered at `CONFIRM_FROM` or above, and replaces those answers.
+    async fn confirm_unsure(
+        &self,
+        confirm: &Target,
+        windows: &[FileState],
+        answers: &mut [Value],
+    ) -> Result<Usage> {
+        let mut jobs = Vec::new();
+        for (i, raw) in answers.iter().enumerate() {
+            let unsure: serde_json::Map<String, Value> = decisions::DETECTORS
+                .iter()
+                .map(|d| decisions::key(d.id))
+                .filter(|key| {
+                    raw.get(key)
+                        .and_then(decisions::yes_probability)
+                        .is_some_and(|p| p >= CONFIRM_FROM)
+                })
+                .map(|key| (key.clone(), QUESTIONS[&key].clone()))
+                .collect();
+            if !unsure.is_empty() {
+                jobs.push((i, Value::Object(unsure)));
+            }
+        }
+        let replies = futures::future::try_join_all(
+            jobs.iter()
+                .map(|(i, questions)| self.ask(confirm, &windows[*i], questions)),
+        )
+        .await?;
+        let mut usage = Usage::default();
+        for ((i, _), (confirmed, used)) in jobs.iter().zip(replies) {
+            usage.add(used);
+            if let (Some(target), Some(confirmed)) =
+                (answers[*i].as_object_mut(), confirmed.as_object())
+            {
+                for (key, mut answer) in confirmed.clone() {
+                    answer["confirmed_by"] = json!(confirm.model);
+                    target.insert(key, answer);
+                }
+            }
+        }
+        Ok(usage)
+    }
+}
+
+/// TypeSafe returns `{answers, usage}`; the Cloudflare REST API wraps the
+/// same payload in `{result, success, errors}`.
+fn parse_response(parsed: Value) -> Result<(Value, Usage)> {
+    let payload = match parsed.get("result") {
+        Some(inner) if inner.get("answers").is_some() => inner,
+        _ => &parsed,
+    };
+    let answers = payload
+        .get("answers")
+        .cloned()
+        .context("System One response has no answers")?;
+    let usage = payload
+        .get("usage")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    Ok((answers, usage))
 }
 
 pub fn classify_http_error(status: reqwest::StatusCode, path: &str, body: &str) -> String {
@@ -494,6 +896,8 @@ mod tests {
             path: "server/src/lib/fm.ts".into(),
             language: "typescript".into(),
             lines: 10,
+            start_line: 1,
+            end_line: 10,
             truncated: false,
             source: String::new(),
         }
@@ -530,19 +934,103 @@ mod tests {
     #[test]
     fn the_endpoint_is_built_from_the_base_url() {
         assert_eq!(
-            format!(
-                "{}{SYSTEM_ONE_PATH}",
-                DEFAULT_BASE_URL.trim_end_matches('/')
-            ),
+            typesafe_endpoint(DEFAULT_BASE_URL),
             "https://api.typesafe.ai/v1/systemone"
         );
         assert_eq!(
-            format!(
-                "{}{SYSTEM_ONE_PATH}",
-                "https://gateway.example/typesafe/".trim_end_matches('/')
-            ),
+            typesafe_endpoint("https://gateway.example/typesafe/"),
             "https://gateway.example/typesafe/v1/systemone"
         );
+    }
+
+    #[test]
+    fn cloudflare_endpoints_accept_a_bare_name_or_a_full_model_id() {
+        assert_eq!(
+            cloudflare_endpoint(CLOUDFLARE_BASE_URL, "acct", "clef-flash"),
+            "https://api.cloudflare.com/client/v4/accounts/acct/ai/run/@cf/cloudflare/clef-flash"
+        );
+        assert_eq!(
+            cloudflare_endpoint("https://gw.example/", "acct", "@cf/cloudflare/clef"),
+            "https://gw.example/accounts/acct/ai/run/@cf/cloudflare/clef"
+        );
+        assert_eq!(body_model("@cf/cloudflare/clef"), "clef");
+        assert_eq!(body_model("jev-latest"), "jev-latest");
+    }
+
+    #[test]
+    fn responses_parse_bare_or_wrapped_in_a_cloudflare_result() {
+        let bare = json!({"answers": {"role": {}}, "usage": {"input_tokens": 7}});
+        let (answers, usage) = parse_response(bare.clone()).unwrap();
+        assert!(answers.get("role").is_some());
+        assert_eq!(usage.input_tokens, 7);
+
+        let wrapped = json!({"result": bare, "success": true, "errors": []});
+        let (answers, usage) = parse_response(wrapped).unwrap();
+        assert!(answers.get("role").is_some());
+        assert_eq!(usage.input_tokens, 7);
+
+        assert!(parse_response(json!({"success": false})).is_err());
+    }
+
+    fn raw_answers(scores: [f32; 6], role_conf: f32, loop_yes: f32) -> Value {
+        let mut answers = json!({
+            "role": {"choice": "data-access", "confidence": role_conf},
+        });
+        for (dimension, score) in DIMENSIONS.iter().zip(scores) {
+            answers[dimension.key] = json!({"score": score, "confidence": 0.9});
+        }
+        for detector in &decisions::DETECTORS {
+            let p = if detector.id == "query_in_loop" {
+                loop_yes
+            } else {
+                0.05
+            };
+            answers[decisions::key(detector.id)] = json!({"choice": if p >= 0.5 { "yes" } else { "no" }, "probabilities": {"yes": p, "no": 1.0 - p}});
+        }
+        answers
+    }
+
+    #[test]
+    fn windows_merge_to_the_worst_score_and_locate_each_decision() {
+        let mut first = state();
+        first.lines = 300;
+        first.end_line = 180;
+        let mut second = first.clone();
+        second.start_line = 160;
+        second.end_line = 300;
+        let record = merge(
+            &[first, second],
+            &[
+                raw_answers([0.2, 1.0, 0.4, 0.0, 0.0, 0.0], 0.95, 0.1),
+                raw_answers([0.1, 0.5, 2.6, 0.0, 0.0, 0.0], 0.6, 0.93),
+            ],
+            None,
+        )
+        .unwrap();
+        assert_eq!(record.scores.complexity, 1.0);
+        assert_eq!(record.scores.data_access_cost, 2.6);
+        assert_eq!(record.worst_dimension, "data_access_cost");
+        assert_eq!(record.role_confidence, 0.95);
+        let looped = &record.decisions[0];
+        assert_eq!(looped.id, "query_in_loop");
+        assert_eq!(looped.band, "act");
+        assert_eq!(looped.lines, Some([160, 300]));
+        assert!(record.has_bad_decision() && record.is_pain_point());
+        assert_eq!(record.decisions.len(), decisions::DETECTORS.len());
+    }
+
+    #[test]
+    fn a_confirmed_bad_decision_ranks_above_a_higher_score() {
+        let single = state();
+        let decided = merge(
+            std::slice::from_ref(&single),
+            &[raw_answers([0.0, 0.0, 1.0, 0.0, 0.0, 0.0], 0.9, 0.9)],
+            None,
+        )
+        .unwrap();
+        assert_eq!(decided.decisions[0].lines, None);
+        let scored = to_record(&single, &answers(0.9, [0.0, 0.0, 2.9, 0.0, 0.0, 0.0]));
+        assert!(decided.rank_key() < scored.rank_key());
     }
 
     #[test]
@@ -559,6 +1047,29 @@ mod tests {
         }
         assert_eq!(DIMENSIONS.len(), 6);
         assert!(!keys.contains_key("agent_rule_compliance"));
+        for detector in &decisions::DETECTORS {
+            let question = &keys[&decisions::key(detector.id)];
+            assert_eq!(question["type"], "choice");
+            assert!(question["criteria"]["yes"]
+                .as_str()
+                .unwrap()
+                .contains(detector.yes));
+        }
+        assert!(
+            keys.len() + crate::rules::MAX_RULE_QUESTIONS <= 64,
+            "Clef accepts at most 64 questions"
+        );
+        for key in keys.keys() {
+            assert!(
+                key.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')),
+                "{key} is not a valid Clef question name"
+            );
+        }
+        assert_eq!(
+            crate::rules::question_key("no raw: error"),
+            "rule.no-raw--error"
+        );
     }
 
     fn model_rule(id: &str, scope: Option<Vec<String>>) -> rules::Rule {
@@ -602,15 +1113,15 @@ mod tests {
         )]);
         let mut file = state();
         file.path = "server/src/routes/fm.ts".into();
-        let with_rules = questions_for(&file, Some(&compiled));
-        assert!(with_rules.get("rule:no-raw-error").is_some());
-        assert_eq!(with_rules["rule:no-raw-error"]["type"], "choice");
+        let with_rules = questions_for(&file.path, Some(&compiled));
+        assert!(with_rules.get("rule.no-raw-error").is_some());
+        assert_eq!(with_rules["rule.no-raw-error"]["type"], "choice");
         assert_eq!(
-            with_rules["rule:no-raw-error"]["criteria"]["true"],
+            with_rules["rule.no-raw-error"]["criteria"]["true"],
             "the file breaks the rule"
         );
         assert_eq!(
-            with_rules["rule:no-raw-error"]["criteria"]["false"],
+            with_rules["rule.no-raw-error"]["criteria"]["false"],
             "the file follows the rule"
         );
         for dimension in DIMENSIONS {
@@ -618,27 +1129,27 @@ mod tests {
         }
 
         file.path = "client/src/App.tsx".into();
-        let without = questions_for(&file, Some(&compiled));
-        assert!(without.get("rule:no-raw-error").is_none());
+        let without = questions_for(&file.path, Some(&compiled));
+        assert!(without.get("rule.no-raw-error").is_none());
         assert_eq!(without, *QUESTIONS);
-        assert_eq!(questions_for(&file, None), *QUESTIONS);
+        assert_eq!(questions_for(&file.path, None), *QUESTIONS);
     }
 
     #[test]
     fn digest_is_stable_without_rules_and_moves_when_they_change() {
         let file = state();
-        let empty = digest(&file, None);
+        let empty = digest(std::slice::from_ref(&file), None);
         let unused = sample_rules(vec![model_rule(
             "no-raw-error",
             Some(vec!["apps/web/**/*".into()]),
         )]);
-        assert_eq!(digest(&file, Some(&unused)), empty);
+        assert_eq!(digest(std::slice::from_ref(&file), Some(&unused)), empty);
 
         let matching = sample_rules(vec![model_rule("no-raw-error", None)]);
-        let first = digest(&file, Some(&matching));
+        let first = digest(std::slice::from_ref(&file), Some(&matching));
         assert_ne!(first, empty);
         let changed = sample_rules(vec![model_rule("use-yup", None)]);
-        assert_ne!(digest(&file, Some(&changed)), first);
+        assert_ne!(digest(std::slice::from_ref(&file), Some(&changed)), first);
     }
 
     #[test]
@@ -682,5 +1193,75 @@ mod tests {
         assert!(err.contains("Invalid request."));
         let bare = classify_http_error(status, "a.ts", "  ");
         assert_eq!(bare, "HTTP 400 classifying a.ts: Bad Request");
+    }
+
+    fn verdict(id: &str, band: &str) -> RuleVerdict {
+        RuleVerdict {
+            rule_id: id.into(),
+            text: id.into(),
+            source: "CLAUDE.md:1".into(),
+            probability: if band == "act" { 0.9 } else { 0.1 },
+            band: band.into(),
+            score: 0.0,
+            answer: None,
+            lines: None,
+        }
+    }
+
+    #[test]
+    fn a_rule_that_fires_on_most_files_is_banded_noisy_and_can_recover() {
+        let mut records: Vec<Record> = (0..12)
+            .map(|i| {
+                let mut r = to_record(&state(), &answers(0.9, [0.0; 6]));
+                r.path = format!("src/f{i}.ts");
+                r.rule_verdicts = vec![
+                    verdict("table-row", if i < 9 { "act" } else { "clear" }),
+                    verdict("real-rule", if i == 0 { "act" } else { "clear" }),
+                ];
+                r
+            })
+            .collect();
+        assert_eq!(
+            mark_noisy_rules(&mut records),
+            vec!["table-row".to_string()]
+        );
+        assert_eq!(records[0].rule_verdicts[0].band, "noisy");
+        assert_eq!(records[0].rule_verdicts[1].band, "act");
+        assert!(records[0].has_rule_violation());
+        assert!(!records[1].is_pain_point());
+
+        for r in records.iter_mut().skip(1) {
+            r.rule_verdicts[0].band = "clear".into();
+        }
+        assert!(mark_noisy_rules(&mut records).is_empty());
+        assert_eq!(records[0].rule_verdicts[0].band, "act");
+
+        let mut few = records[..3].to_vec();
+        for r in &mut few {
+            r.rule_verdicts[0].band = "act".into();
+        }
+        assert!(
+            mark_noisy_rules(&mut few).is_empty(),
+            "too few files to call a rule noisy"
+        );
+    }
+
+    #[test]
+    fn a_confirmed_answer_is_recorded_on_the_decision() {
+        let mut raw = raw_answers([0.0; 6], 0.9, 0.2);
+        raw[decisions::key("query_in_loop")] = json!({"choice": "yes", "probabilities": {"yes": 0.91, "no": 0.09}, "confirmed_by": "clef"});
+        let record = merge(std::slice::from_ref(&state()), &[raw], None).unwrap();
+        let looped = record
+            .decisions
+            .iter()
+            .find(|d| d.id == "query_in_loop")
+            .unwrap();
+        assert_eq!(looped.confirmed_by.as_deref(), Some("clef"));
+        assert_eq!(looped.band, "act");
+        assert!(record
+            .decisions
+            .iter()
+            .filter(|d| d.id != "query_in_loop")
+            .all(|d| d.confirmed_by.is_none()));
     }
 }

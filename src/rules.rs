@@ -171,7 +171,7 @@ pub enum Question {
 }
 
 impl Question {
-    pub fn to_jev(&self) -> Value {
+    pub fn to_systemone(&self) -> Value {
         match self {
             Question::Boolean {
                 instructions,
@@ -235,6 +235,8 @@ pub struct RuleVerdict {
     pub score: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub answer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lines: Option<[usize; 2]>,
 }
 
 fn round2<S: serde::Serializer>(value: &f32, serializer: S) -> Result<S::Ok, S::Error> {
@@ -1650,8 +1652,11 @@ pub fn verdicts_from_answers(
         let Check::Model { question, .. } = &rule.check else {
             continue;
         };
-        let key = format!("rule:{}", rule.id);
-        let Some(answer) = answers.get(&key).or_else(|| answers.get(&rule.id)) else {
+        let Some(answer) = answers
+            .get(question_key(&rule.id))
+            .or_else(|| answers.get(format!("rule:{}", rule.id)))
+            .or_else(|| answers.get(&rule.id))
+        else {
             continue;
         };
         let (probability, picked) = violation_probability(question, answer);
@@ -1664,10 +1669,29 @@ pub fn verdicts_from_answers(
             band: band_for(probability, thresholds).to_string(),
             score: probability * 3.0,
             answer: picked,
+            lines: None,
         });
     }
     out.sort_by(|a, b| b.probability.total_cmp(&a.probability));
     out
+}
+
+/// The question name a rule is sent under. Clef only accepts names matching
+/// `^[A-Za-z0-9_.-]{1,100}$`, so the separator is a dot and a hand-edited
+/// id is reduced to that alphabet.
+pub fn question_key(id: &str) -> String {
+    let safe: String = id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(95)
+        .collect();
+    format!("rule.{safe}")
 }
 
 pub fn questions_for_rules(base: Value, rules: &[&Rule]) -> Value {
@@ -1680,7 +1704,7 @@ pub fn questions_for_rules(base: Value, rules: &[&Rule]) -> Value {
     };
     for rule in rules.iter().take(MAX_RULE_QUESTIONS) {
         if let Check::Model { question, .. } = &rule.check {
-            map.insert(format!("rule:{}", rule.id), question.to_jev());
+            map.insert(question_key(&rule.id), question.to_systemone());
         }
     }
     questions
@@ -1934,18 +1958,18 @@ mod tests {
             json!({ "role": { "type": "choice" } }),
             &rules.model_rules_for("src/api.ts"),
         );
-        assert!(questions.get("rule:no-raw-error").is_some());
-        assert_eq!(questions["rule:no-raw-error"]["type"], "choice");
+        assert!(questions.get("rule.no-raw-error").is_some());
+        assert_eq!(questions["rule.no-raw-error"]["type"], "choice");
         assert_eq!(
-            questions["rule:no-raw-error"]["criteria"]["true"],
+            questions["rule.no-raw-error"]["criteria"]["true"],
             "the file breaks the rule"
         );
         assert_eq!(
-            questions["rule:no-raw-error"]["criteria"]["false"],
+            questions["rule.no-raw-error"]["criteria"]["false"],
             "the file follows the rule"
         );
         let none = questions_for_rules(json!({ "role": { "type": "choice" } }), &[]);
-        assert!(none.get("rule:no-raw-error").is_none());
+        assert!(none.get("rule.no-raw-error").is_none());
     }
 
     #[test]
@@ -2099,7 +2123,7 @@ mod tests {
             instructions: "broken?".into(),
             criteria: None,
         };
-        let sent = boolean.to_jev();
+        let sent = boolean.to_systemone();
         assert_eq!(sent["type"], "choice");
         assert_eq!(sent["criteria"]["true"], "the file breaks the rule");
         let (p, ans) = violation_probability(

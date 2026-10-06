@@ -1,5 +1,5 @@
-use crate::jev::{Record, Usage};
 use crate::scan::{self, Config, Event};
+use crate::systemone::{Record, Usage};
 use anyhow::Result;
 use std::collections::HashMap;
 
@@ -69,6 +69,7 @@ pub fn blocking(
         }
     }
 
+    crate::systemone::mark_noisy_rules(&mut outcome.records);
     outcome
         .records
         .sort_by(|a, b| a.rank_key().cmp(&b.rank_key()));

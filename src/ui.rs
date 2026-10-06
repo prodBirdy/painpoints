@@ -1,6 +1,6 @@
-use crate::jev::{level_of, Record, Usage, DIMENSIONS, PAIN_THRESHOLD};
 use crate::report::Report;
 use crate::scan::Event;
+use crate::systemone::{level_of, Record, Usage, DIMENSIONS, PAIN_THRESHOLD};
 use gpui::{
     div, prelude::*, px, relative, rgb, rgba, uniform_list, AnyElement, AsyncApp, Context, Div,
     Entity, FontWeight, Rgba, SharedString, Stateful, Window,
@@ -124,6 +124,8 @@ impl PainPoints {
             }
             Event::Failed { path, error } => self.failures.push((path, error)),
             Event::Finished { usage, cached } => {
+                crate::systemone::mark_noisy_rules(&mut self.records);
+                self.records.sort_by(|a, b| a.rank_key().cmp(&b.rank_key()));
                 self.usage = usage;
                 self.cached = cached;
                 self.finished = true;
@@ -146,10 +148,7 @@ impl PainPoints {
     }
 
     fn pain_points(&self) -> usize {
-        self.records
-            .iter()
-            .filter(|r| r.worst_score >= PAIN_THRESHOLD || r.has_rule_violation())
-            .count()
+        self.records.iter().filter(|r| r.is_pain_point()).count()
     }
 
     fn hits(&self, key: &str) -> usize {
@@ -613,7 +612,7 @@ impl PainPoints {
                 .into_any_element();
         };
 
-        let mut ranked: Vec<(&crate::jev::Dimension, f32)> = DIMENSIONS
+        let mut ranked: Vec<(&crate::systemone::Dimension, f32)> = DIMENSIONS
             .iter()
             .map(|d| (d, record.scores.get(d.key)))
             .collect();
@@ -684,6 +683,49 @@ impl PainPoints {
                             .child(dimension.levels[level_of(score)]),
                     )
                     .child(label(dimension.source)),
+            );
+        }
+
+        for decision in &record.decisions {
+            if decision.band == "clear" {
+                continue;
+            }
+            let color = if decision.band == "act" { DANGER } else { WARN };
+            let lines = decision
+                .lines
+                .map(|[a, b]| format!("lines {a}-{b}"))
+                .unwrap_or_else(|| "whole file".into());
+            detail = detail.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .p(px(12.))
+                    .rounded(px(10.))
+                    .bg(rgb(RAISED))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .flex_grow()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(TEXT))
+                                    .child(SharedString::from(decision.label.clone())),
+                            )
+                            .child(number(
+                                format!("{:.2}", decision.probability),
+                                36.,
+                                color,
+                                12.,
+                            )),
+                    )
+                    .child(label(SharedString::from(format!(
+                        "{} · {lines}",
+                        decision.dimension.replace('_', " ")
+                    )))),
             );
         }
 
