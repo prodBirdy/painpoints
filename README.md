@@ -49,14 +49,15 @@ level its score landed on and the standard behind it.
 cargo install --git https://github.com/prodBirdy/painpoints
 ```
 
-or clone and `cargo build --release`. The judgments come from
-[TypeSafe](https://typesafe.ai)'s Jev model, a System One model that returns
-typed answers and calibrated probabilities rather than prose. See
-[Jev: key, gateway, model and cost](#jev-key-gateway-model-and-cost) for setup.
+or clone and `cargo build --release`. The judgments come from a System One
+model, one that returns typed answers and calibrated probabilities rather than
+prose: [TypeSafe](https://typesafe.ai)'s Jev or Cloudflare's Clef. See
+[Models: Jev or Clef](#models-jev-or-clef) for setup.
 
 ```
 painpoints [TARGET] [options]
 painpoints compile [TARGET]
+painpoints eval
 painpoints mcp
 
   TARGET            a repository to classify, or a single source file
@@ -67,10 +68,21 @@ painpoints mcp
   --headless        write the report without opening a window
   --json            print the result to stdout as JSON and write nothing else
   --refresh         reclassify everything instead of reusing the saved report
+  -h, --help        this text
 
-  compile [TARGET]  discover AGENTS.md and friends, write .painpoints/rules.json
+  compile           discover AGENTS.md and friends, write .painpoints/rules.json
   --draft           after compile, print how to hand-edit model questions
-  mcp               serve the Model Context Protocol on stdio
+  eval              run the built-in labelled files through the configured
+                    model and print how well each bad-decision detector
+                    separates the planted problem from clean code
+  mcp               serve the Model Context Protocol on stdio, exposing
+                    painpoints_file and painpoints_repo
+
+Classifying needs a System One model. compile does not.
+  TypeSafe Jev:    TYPESAFE_API_KEY (optional TYPESAFE_BASE_URL)
+  Cloudflare Clef: CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID
+  PAINPOINTS_PROVIDER=typesafe|cloudflare picks one when both are set;
+  PAINPOINTS_MODEL overrides the model (default jev-latest or clef-flash).
 ```
 
 `compile` does not call the model and does not need an API key. Classify loads
@@ -84,9 +96,11 @@ as a normal checkout.
 
 ## What it scores
 
-Each file gets one `role` and six scores from 0 (healthy) to 3 (painful). 2.0
-and above counts as a pain point. Files rank by their worst dimension first,
-then by how many dimensions hurt.
+Each file gets one `role`, six scores from 0 (healthy) to 3 (painful), and a
+verdict on ten concrete [bad decisions](#bad-decisions). A score of 2.0 and
+above, a confirmed bad decision or a broken agent rule makes a file a pain
+point. Files with confirmed bad decisions or rule violations rank first, then
+by their worst dimension, then by how many dimensions hurt.
 
 | dimension | the question it answers | standard behind the levels |
 | --- | --- | --- |
@@ -101,50 +115,112 @@ The criteria sent to the model describe those situations in plain terms, with
 no framework or vendor names, so the scores mean the same thing in a Django
 service as in a Next.js app.
 
-## Jev: key, gateway, model and cost
+Long files are read whole, in overlapping windows of up to 8000 characters (at
+most six per file); a file is as painful as its worst window.
 
-painpoints reads the same variables as TypeSafe's own SDKs, so a setup that
-works for their Python or JavaScript client works here unchanged.
+## Bad decisions
+
+The dimension scores answer "how much of this quality does the file have",
+and a model asked that about a whole file drifts to the middle of the scale.
+So each file is also asked ten narrow questions of the form "is there at least
+one ...", each with a worked example of the mistake and of the fix. These are
+what name something specific to fix:
+
+| detector | dimension | catches |
+| --- | --- | --- |
+| `query_in_loop` | data access cost | a query or remote call per item of another result set |
+| `unbounded_read` | data access cost | a whole table or collection read with no limit or filter |
+| `swallowed_error` | failure handling | a catch that returns null, empty or a default so failure looks like "not found" |
+| `unsafe_retry` | failure handling | retries with no backoff or timeout, or a retried charge/create/send with no idempotency key |
+| `injection` | trust boundary risk | external input interpolated into SQL, a shell command, a path, HTML or a redirect |
+| `missing_ownership_check` | trust boundary risk | a handler that reads, changes or deletes a record by a request id without checking who owns it |
+| `hardcoded_secret` | trust boundary risk | a password, key or token written into the source |
+| `raw_error_to_user` | trust boundary risk | `error.message`, `String(error)` or a stack sent to a client |
+| `speculative_abstraction` | complexity | an interface, factory or option with one implementation or value |
+| `layer_mixing` | boundary leak | a UI component that queries a database or holds pricing, permission or eligibility rules |
+
+A detector at 0.75 or above is `act` and becomes a finding (`bad:<id>`, with
+the line range of the window it was found in when the file needed more than
+one); 0.5 to 0.75 is `flag` and marks the file for review.
+
+**Measured, not assumed.** `painpoints eval` runs fourteen labelled files
+built into the binary (ten with one planted bad decision each, four clean
+counterparts) through whatever model is configured and prints, per detector,
+the probability on the planted file and the worst probability on any other
+file. On Cloudflare with the default cascade:
+
+```
+detectors at 0.75: caught 10/10 planted, 0 false alarms in 130 checks
+dimension scores at 2.0: caught 4/10 planted
+```
+
+The planted files were written alongside the questions, so that is an upper
+bound. On 40 backend files of a real Hono/Kysely service the same setup
+confirmed 12 bad decisions (raw errors returned to clients, swallowed database
+errors, per-item remote calls in a loop), every one of which was real on
+reading the code, and missed two that a reader would flag.
+## Models: Jev or Clef
+
+Every System One model takes the same request (`model`, `state`, `questions`)
+and answers the same way, so painpoints only needs to know where to send it.
 
 | variable | default | purpose |
 | --- | --- | --- |
-| `TYPESAFE_API_KEY` | none | Bearer token sent as `Authorization: Bearer <key>` |
-| `TYPESAFE_BASE_URL` | `https://api.typesafe.ai` | Where requests go; `/v1/systemone` is appended |
-| `TYPESAFE_DEFAULT_MODEL` | `jev-latest` | Which Jev release answers |
+| `PAINPOINTS_PROVIDER` | whichever key is set, TypeSafe first | `typesafe` or `cloudflare` |
+| `PAINPOINTS_MODEL` | `jev-latest` or `clef-flash` | the model that answers every question |
+| `PAINPOINTS_CONFIRM_MODEL` | `clef` behind `clef-flash`, otherwise none | a larger model that re-answers unsure detector questions; `none` turns it off |
+| `TYPESAFE_API_KEY` | none | TypeSafe bearer token |
+| `TYPESAFE_BASE_URL` | `https://api.typesafe.ai` | TypeSafe or a gateway in front of it; `/v1/systemone` is appended |
+| `TYPESAFE_DEFAULT_MODEL` | `jev-latest` | Jev release, when `PAINPOINTS_MODEL` is not set |
+| `CLOUDFLARE_API_TOKEN` | none | Cloudflare API token with the Workers AI permission |
+| `CLOUDFLARE_ACCOUNT_ID` | none | the account the token belongs to (`cf auth whoami` shows it) |
+| `CLOUDFLARE_BASE_URL` | `https://api.cloudflare.com/client/v4` | Cloudflare API or an AI Gateway in front of it |
 
-**Direct.** Create a key in your [TypeSafe](https://typesafe.ai) account and
-export it:
+**TypeSafe Jev.** Create a key in your [TypeSafe](https://typesafe.ai)
+account. painpoints reads the same variables as TypeSafe's own SDKs:
 
 ```
 export TYPESAFE_API_KEY=<your key>
 painpoints . --headless
 ```
 
-**Through a gateway.** If your organisation fronts TypeSafe with an API
-gateway (for spend limits, audit logging or a shared key), point the base URL
-at it and pass the gateway's token as the key. painpoints sends a plain
-`POST <base>/v1/systemone` with a JSON body and a bearer header, so any proxy
-that forwards that shape works:
+To go through an API gateway (spend limits, audit logging, a shared key),
+point `TYPESAFE_BASE_URL` at it and pass the gateway's token as the key;
+painpoints sends a plain `POST <base>/v1/systemone` with a bearer header.
+
+**Cloudflare Clef.** [Clef and Clef-flash](https://developers.cloudflare.com/workers-ai/models/clef/)
+run on Workers AI. Create an API token with the Workers AI permission:
 
 ```
-export TYPESAFE_BASE_URL=https://ai-gateway.example.com/typesafe
-export TYPESAFE_API_KEY=<gateway token>
+export CLOUDFLARE_API_TOKEN=<token>
+export CLOUDFLARE_ACCOUNT_ID=<account id>
+painpoints . --headless
 ```
 
-**Pinning the model.** `jev-latest` moves when TypeSafe ships a new release.
-The cache digest includes the model name, so a rerun after the alias moves
-reclassifies everything. If you have tuned what counts as a pain point against
-one release, pin it:
+By default every question goes to Clef-flash, and any bad-decision question
+it answers at 0.3 or above is asked again of Clef on the same window, alone.
+On real code Clef-flash scores genuine problems between 0.3 and 0.7 where Clef
+scores them above 0.9, while a few percent of questions reach the cut-off, so
+the cascade gets close to Clef's accuracy for a small part of Clef's price.
+Decisions answered this way carry `confirmed_by`. Set
+`PAINPOINTS_MODEL=clef` to use Clef for everything, or
+`PAINPOINTS_CONFIRM_MODEL=none` for Clef-flash alone.
+
+**Pinning the model.** Aliases such as `jev-latest` move. The cache digest
+includes the model names, so a rerun after one moves, or after switching
+provider, reclassifies everything. Pin a release if you have tuned against it:
 
 ```
-export TYPESAFE_DEFAULT_MODEL=jev-1.13.0
+export PAINPOINTS_MODEL=jev-1.13.0
 ```
 
-**Cost.** Each file is one request of roughly 4 to 5 thousand input tokens
-(the first 8000 characters of the file plus the question set); output tokens
-are free. At TypeSafe's published rate of $0.042 per million input tokens the
-189-file repository in the screenshot cost about three cents to classify once,
-and nothing to reopen.
+**Cost.** Each window is one request: the window's source plus the question
+set, about 4 to 5 thousand input tokens for a file with no matching agent
+rules, more with them (each compiled rule adds a question). Output tokens are
+free. Jev costs $0.042 per million input tokens. Clef-flash costs $0.09 and
+Clef $0.24, which on Workers AI's free allocation of 10,000 neurons a day is
+about 1.2 million Clef-flash tokens; 40 files of a real service with 20 agent
+rules took about 560 thousand tokens including the Clef confirmations.
 
 ## Saved results
 
@@ -181,10 +257,10 @@ painpoints compile .
 
 Classify loads that file (or compiles it if it is missing or stale against
 source hashes). Active `model` rules whose `scope` matches the file become
-extra Jev questions on the same SystemOne call as the six dimensions. They sit
+extra questions on the same System One call as the six dimensions. They sit
 beside those dimensions, not in place of them: violations land in `findings`
 as `rule:<id>`, quoting the instruction and pointing at `AGENTS.md:12`.
-Architecture scores and ranking stay the same. Lint rules are recorded only.
+Architecture scores stay the same. Lint rules are recorded only.
 `when: turn` rules stay in `rules.json` but are not judged on a whole-file
 classify.
 
@@ -194,19 +270,42 @@ model-rule caps. Path-scoped rules are preferred when picking the per-file
 question budget. Compile prints which sources were truncated instead of
 dropping them silently.
 
+A rule that comes back broken on half or more of the files it was asked about
+(at least ten) is banded `noisy` instead of `act`: that almost always means the
+question does not fit those files, such as a table row or a rule about another
+app in the same repository, not that the repository breaks its own rule
+everywhere. Noisy rules are listed in the report's `noisy_rules` and do not
+rank files or appear in findings until the question is rewritten or scoped.
+
 The compile is deterministic: it extracts instruction sentences and scaffolds
-a TypeSafe `choice` question per model rule (true/false criteria,
-`violating: ["true"]`). SystemOne has no boolean type. `--draft` prints how to
-hand-edit those questions so a violating file scores near 1 and a clean file
-near 0. Do not add rules the instruction files do not state.
+a `choice` question per model rule (true/false criteria,
+`violating: ["true"]`), sent as `rule.<id>` because Clef only accepts question
+names made of letters, digits, `_`, `.` and `-`. Scaffolds restate the
+rule and rarely separate violating files from clean ones, so refine them by
+hand or with the `painpoints-rules` skill: ask whether a concrete construct
+exists, give a violating and a compliant example in the codebase's own idiom,
+and scope the rule to the paths it is about. `--draft` prints a short version
+of that guidance. A single-file `--json` result lists every rule's
+`probability` under `rule_verdicts`, which is how a rewritten question is
+tested.
+
+Hand edits survive recompiles: when an instruction file changes, every rule
+whose instruction text is still there keeps its id, `scope`, `when`, `status`
+and question, and `thresholds` are kept. Rules whose instruction was removed
+go with it. Delete `rules.json` to start from scaffolds. Do not add rules the
+instruction files do not state.
 
 ## For agents
 
 Three ways in, all sharing one cache, plus `painpoints compile [TARGET]` to
 refresh `.painpoints/rules.json` without calling the model. The repository
-also ships a Claude Code skill at `.claude/skills/painpoints/SKILL.md` that
-tells an agent when to reach for the tool, which entry point to pick, and how
-to read a result without over-claiming.
+also ships two Claude Code skills. `.claude/skills/painpoints/SKILL.md` tells
+an agent when to reach for the tool, which entry point to pick, and how to
+read a result without over-claiming. `.claude/skills/painpoints-rules/SKILL.md`
+teaches it to turn the compiled scaffolds in `rules.json` into questions a
+System One model answers well, and to test each one on a violating and a
+compliant file. Copy either into `~/.claude/skills/` to use it in every
+repository.
 
 **One file, atomic.** Point it at a single file and get that file's result on
 stdout. Nothing else is read, nothing else is written.
@@ -238,8 +337,11 @@ $ painpoints src/routes/admin.ts --json
 
 `findings` is the part worth acting on: one entry per architecture dimension
 at 2.0 or above, carrying the level the score landed on, its description, and
-the published standard behind it, plus one entry per agent-rule violation
-(`dimension` is `rule:<id>`, `source` is the instruction file and line). A
+the published standard behind it, one entry per confirmed bad decision
+(`dimension` is `bad:<id>`, with `lines` when the file was read in more than
+one window and `confirmed_by` when a confirming model answered), and one per
+agent-rule violation (`dimension` is `rule:<id>`, `source` is the instruction
+file and line). A
 healthy file returns an empty `findings` array, which is a real answer rather
 than a shrug.
 
@@ -267,10 +369,13 @@ stdio with two tools:
 }
 ```
 
-Scores are model judgments over the first 8000 characters of a file. They are a
-reading order, not evidence. Anything flagged `needs_review` is where the model
-itself was unsure, and a file whose interesting code starts past 8000
-characters is judged on what came before it.
+For Clef, put `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` in `env`
+instead.
+
+Scores and decisions are model judgments over the file, read in windows of up
+to 8000 characters (at most six per file, so a very long file is judged on its
+first 40 thousand or so). They are a reading order, not evidence. Anything
+flagged `needs_review` is where the model itself was unsure.
 
 ## Related
 

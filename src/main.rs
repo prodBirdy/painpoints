@@ -1,9 +1,11 @@
-mod jev;
+mod decisions;
+mod eval;
 mod mcp;
 mod report;
 mod rules;
 mod run;
 mod scan;
+mod systemone;
 mod ui;
 
 use anyhow::{bail, Result};
@@ -14,6 +16,7 @@ use std::path::PathBuf;
 const USAGE: &str = "\
 painpoints [TARGET] [options]
 painpoints compile [TARGET]
+painpoints eval
 painpoints mcp
 
   TARGET            a repository to classify, or a single source file
@@ -28,10 +31,17 @@ painpoints mcp
 
   compile           discover AGENTS.md and friends, write .painpoints/rules.json
   --draft           after compile, print how to hand-edit model questions
+  eval              run the built-in labelled files through the configured
+                    model and print how well each bad-decision detector
+                    separates the planted problem from clean code
   mcp               serve the Model Context Protocol on stdio, exposing
                     painpoints_file and painpoints_repo
 
-Needs TYPESAFE_API_KEY in the environment to classify. compile does not.";
+Classifying needs a System One model. compile does not.
+  TypeSafe Jev:    TYPESAFE_API_KEY (optional TYPESAFE_BASE_URL)
+  Cloudflare Clef: CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID
+  PAINPOINTS_PROVIDER=typesafe|cloudflare picks one when both are set;
+  PAINPOINTS_MODEL overrides the model (default jev-latest or clef-flash).";
 
 #[derive(PartialEq)]
 enum Mode {
@@ -81,7 +91,10 @@ fn compile_cmd() -> Result<()> {
         eprintln!("found 0 instruction files under {}", root.display());
         return Ok(());
     }
-    let (compiled, notes) = rules::compile_with_notes(&root, &candidates);
+    let (mut compiled, notes) = rules::compile_with_notes(&root, &candidates);
+    if let Some(previous) = rules::load(&dest) {
+        rules::carry_over(&mut compiled, &previous);
+    }
     rules::write(&dest, &compiled)?;
     let (model, lint, deferred, unenforceable) = compiled.bucket_counts();
     eprintln!(
@@ -195,11 +208,7 @@ fn headless(args: Args) -> Result<()> {
         "{} files ({} reused), {} pain points, {} in / {} out tokens",
         report.records.len(),
         outcome.cached,
-        report
-            .records
-            .iter()
-            .filter(|r| r.worst_score >= jev::PAIN_THRESHOLD || r.has_rule_violation())
-            .count(),
+        report.records.iter().filter(|r| r.is_pain_point()).count(),
         report.usage.input_tokens,
         report.usage.output_tokens
     );
@@ -236,6 +245,7 @@ fn main() -> Result<()> {
     match std::env::args().nth(1).as_deref() {
         Some("mcp") => return mcp::serve(),
         Some("compile") => return compile_cmd(),
+        Some("eval") => return eval::run(),
         _ => {}
     }
 

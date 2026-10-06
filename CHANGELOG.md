@@ -1,5 +1,65 @@
 # Changelog
 
+## 0.3.0 — 2026-10-06
+
+Minor release: any System One model, and findings that name concrete bad
+decisions instead of only scoring how much of a quality a file has.
+
+### Models
+
+- Cloudflare Workers AI is a provider beside TypeSafe: `CLOUDFLARE_API_TOKEN`
+  and `CLOUDFLARE_ACCOUNT_ID` select Clef, `PAINPOINTS_PROVIDER` picks when
+  both credentials are set, and `PAINPOINTS_MODEL` overrides the model for
+  either. Existing `TYPESAFE_*` setups behave as before.
+- The Cloudflare `{result, success}` envelope is unwrapped.
+- On Cloudflare, Clef-flash answers everything and Clef re-answers any
+  bad-decision question Clef-flash put at 0.3 or above
+  (`PAINPOINTS_CONFIRM_MODEL`, `none` to turn it off). Decisions answered
+  that way carry `confirmed_by`.
+- Rule questions are sent as `rule.<id>` (was `rule:<id>`): Clef only accepts
+  question names made of letters, digits, `_`, `.` and `-`. Answers keyed the
+  old way are still read.
+- The model module is `systemone`, not `jev`.
+
+### Bad decisions
+
+- Ten existence questions with worked examples: query in a loop, unbounded
+  read, swallowed error, unsafe retry, injection, missing ownership check,
+  hardcoded secret, raw error shown to a user, speculative abstraction and
+  data access or business rules inside UI. A detector at 0.75 or above is a
+  `bad:<id>` finding; files with confirmed decisions or rule violations rank
+  first. `summary.by_decision` counts them.
+- `painpoints eval` runs fourteen labelled files built into the binary
+  through the configured model and prints how well each detector separates
+  the planted problem from clean code, next to how many the dimension scores
+  catch.
+
+### Coverage and noise
+
+- Long files are read whole, in overlapping windows of up to 8000 characters
+  (at most six), instead of only their first 8000 characters. Scores take the
+  worst window; decisions and rule verdicts carry the `lines` of the window
+  they were found in.
+- A compiled rule that comes back broken on half or more of at least ten
+  files is banded `noisy`, listed in `summary.noisy_rules` and the Markdown
+  report, and left out of findings and ranking.
+- The Markdown report's file table no longer ends its separator row with an
+  extra `|`.
+
+### Rules
+
+- Recompiling after an instruction file changes keeps hand-edited rules:
+  every rule whose instruction text is still in the sources keeps its id,
+  scope, phase, question and status, and `thresholds` are kept. Before, any
+  change to `AGENTS.md` silently replaced the whole file with fresh
+  scaffolds.
+- A single-file `--json` result and `painpoints_file` include every
+  `decisions` and `rule_verdicts` entry with its probability, so a rewritten
+  rule can be tested on a violating and a compliant file.
+- New `painpoints-rules` skill: how to bucket, scope, phrase and test rule
+  questions for a System One model, from what `painpoints eval` and a real
+  run measured.
+
 ## 0.2.0 — 2026-09-19
 
 Minor release: compile the target repository's own agent-instruction files

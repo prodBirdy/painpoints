@@ -1,6 +1,6 @@
-use crate::jev::{level_of, Record, Usage, DIMENSIONS, PAIN_THRESHOLD};
 use crate::report::Report;
 use crate::scan::Event;
+use crate::systemone::{level_of, Record, Usage, DIMENSIONS, PAIN_THRESHOLD};
 use gpui::{
     div, prelude::*, px, relative, rgb, rgba, uniform_list, AnyElement, AsyncApp, Context, Div,
     Entity, FontWeight, Rgba, SharedString, Stateful, Window,
@@ -124,6 +124,8 @@ impl PainPoints {
             }
             Event::Failed { path, error } => self.failures.push((path, error)),
             Event::Finished { usage, cached } => {
+                crate::systemone::mark_noisy_rules(&mut self.records);
+                self.records.sort_by(|a, b| a.rank_key().cmp(&b.rank_key()));
                 self.usage = usage;
                 self.cached = cached;
                 self.finished = true;
@@ -146,10 +148,7 @@ impl PainPoints {
     }
 
     fn pain_points(&self) -> usize {
-        self.records
-            .iter()
-            .filter(|r| r.worst_score >= PAIN_THRESHOLD || r.has_rule_violation())
-            .count()
+        self.records.iter().filter(|r| r.is_pain_point()).count()
     }
 
     fn hits(&self, key: &str) -> usize {
@@ -363,7 +362,10 @@ impl PainPoints {
                     .when(spent, |el| {
                         el.child(stat(
                             "TOKENS",
-                            format!("{} in / {} out", self.usage.input_tokens, self.usage.output_tokens),
+                            format!(
+                                "{} in / {} out",
+                                self.usage.input_tokens, self.usage.output_tokens
+                            ),
                         ))
                     })
                     .child(
@@ -544,18 +546,16 @@ impl PainPoints {
             .py(px(14.));
 
         let Some(record) = self.current() else {
-            let mut summary = panel
-                .child(label("THIS REPOSITORY"))
-                .child(
-                    div()
-                        .text_size(px(13.))
-                        .text_color(rgb(TEXT))
-                        .child(format!(
-                            "{} of {} files carry a pain point",
-                            self.pain_points(),
-                            self.records.len()
-                        )),
-                );
+            let mut summary = panel.child(label("THIS REPOSITORY")).child(
+                div()
+                    .text_size(px(13.))
+                    .text_color(rgb(TEXT))
+                    .child(format!(
+                        "{} of {} files carry a pain point",
+                        self.pain_points(),
+                        self.records.len()
+                    )),
+            );
             for dimension in DIMENSIONS {
                 let count = self.hits(dimension.key);
                 summary = summary.child(
@@ -612,7 +612,7 @@ impl PainPoints {
                 .into_any_element();
         };
 
-        let mut ranked: Vec<(&crate::jev::Dimension, f32)> = DIMENSIONS
+        let mut ranked: Vec<(&crate::systemone::Dimension, f32)> = DIMENSIONS
             .iter()
             .map(|d| (d, record.scores.get(d.key)))
             .collect();
@@ -683,6 +683,49 @@ impl PainPoints {
                             .child(dimension.levels[level_of(score)]),
                     )
                     .child(label(dimension.source)),
+            );
+        }
+
+        for decision in &record.decisions {
+            if decision.band == "clear" {
+                continue;
+            }
+            let color = if decision.band == "act" { DANGER } else { WARN };
+            let lines = decision
+                .lines
+                .map(|[a, b]| format!("lines {a}-{b}"))
+                .unwrap_or_else(|| "whole file".into());
+            detail = detail.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .p(px(12.))
+                    .rounded(px(10.))
+                    .bg(rgb(RAISED))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .flex_grow()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(TEXT))
+                                    .child(SharedString::from(decision.label.clone())),
+                            )
+                            .child(number(
+                                format!("{:.2}", decision.probability),
+                                36.,
+                                color,
+                                12.,
+                            )),
+                    )
+                    .child(label(SharedString::from(format!(
+                        "{} · {lines}",
+                        decision.dimension.replace('_', " ")
+                    )))),
             );
         }
 
@@ -843,28 +886,36 @@ impl Render for PainPoints {
                                     uniform_list(
                                         "records",
                                         count,
-                                        cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
-                                            range
-                                                .map(|i| {
-                                                    let record = &visible[i];
-                                                    let path = record.path.clone();
-                                                    let chosen =
-                                                        this.selected.as_deref() == Some(path.as_str());
-                                                    row(i, record, chosen)
-                                                        .on_click(cx.listener(move |this, _event, _window, cx| {
-                                                            this.selected = if this.selected.as_deref()
-                                                                == Some(path.as_str())
-                                                            {
-                                                                None
-                                                            } else {
-                                                                Some(path.clone())
-                                                            };
-                                                            cx.notify();
-                                                        }))
-                                                        .into_any_element()
-                                                })
-                                                .collect()
-                                        }),
+                                        cx.processor(
+                                            move |this,
+                                                  range: std::ops::Range<usize>,
+                                                  _window,
+                                                  cx| {
+                                                range
+                                                    .map(|i| {
+                                                        let record = &visible[i];
+                                                        let path = record.path.clone();
+                                                        let chosen = this.selected.as_deref()
+                                                            == Some(path.as_str());
+                                                        row(i, record, chosen)
+                                                            .on_click(cx.listener(
+                                                                move |this, _event, _window, cx| {
+                                                                    this.selected =
+                                                                        if this.selected.as_deref()
+                                                                            == Some(path.as_str())
+                                                                        {
+                                                                            None
+                                                                        } else {
+                                                                            Some(path.clone())
+                                                                        };
+                                                                    cx.notify();
+                                                                },
+                                                            ))
+                                                            .into_any_element()
+                                                    })
+                                                    .collect()
+                                            },
+                                        ),
                                     )
                                     .flex_grow(),
                                 )

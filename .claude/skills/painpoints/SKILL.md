@@ -5,8 +5,9 @@ description: Use when asked where the architectural pain points, technical debt 
 
 # painpoints
 
-Scores source files 0 to 3 on six architectural dimensions with TypeSafe's Jev
-model. Every dimension's levels describe situations published by Google,
+Scores source files 0 to 3 on six architectural dimensions and checks them for
+ten concrete bad decisions with a System One model (TypeSafe's Jev or
+Cloudflare's Clef). Every dimension's levels describe situations published by Google,
 Amazon and OWASP, and every finding carries the URL of that standard. Use it
 to decide what to read and what to touch first, not as proof that something is
 wrong.
@@ -47,21 +48,34 @@ friends without calling the model.
 ```
 
 - `findings` is the actionable part: one entry per architecture dimension at
-  2.0 or above, plus one entry per agent-rule violation (`dimension` starts
-  with `rule:`). An empty array means the file is healthy on every dimension
-  and every compiled project rule; say so rather than inventing concerns.
-- `is_pain_point` is `worst_score >= 2.0`.
-- `needs_review` means the model itself was unsure. Read the file before
-  acting on its scores.
-- Scores cover the first 8000 characters of a file. A file whose interesting
-  code starts later was judged on what came before it.
+  2.0 or above, one per confirmed bad decision (`dimension` starts with
+  `bad:`, `lines` says which part of a long file), and one per agent-rule
+  violation (`dimension` starts with `rule:`). An empty array means the file
+  is healthy on every dimension, decision and compiled project rule; say so
+  rather than inventing concerns.
+- `bad:` findings are the most specific: open the lines they name and confirm
+  the decision before fixing it. They are model judgments with a probability,
+  not proof.
+- `is_pain_point` is a dimension at 2.0 or above, a confirmed bad decision or
+  a broken agent rule.
+- `needs_review` means the model itself was unsure, or a decision or rule
+  landed in the uncertain band. Read the file before acting on its scores.
+- Long files are read in overlapping windows of up to 8000 characters, at
+  most six per file.
 
 ## Read a repository result
 
 - `summary.by_dimension` says what kind of pain the repo has. Lead with the
   dimension that has the most files, and name the standard behind it.
-- `files` (report) or `top` (MCP) is ranked worst dimension first, then by how
-  many dimensions hurt. Work top down.
+- `summary.by_decision` counts confirmed bad decisions by kind; these are the
+  quickest concrete wins.
+- `files` (report) or `top` (MCP) puts files with confirmed bad decisions or
+  rule violations first, then ranks by worst dimension and how many dimensions
+  hurt. Work top down.
+- `summary.noisy_rules` lists compiled agent rules that misfired on most
+  files. Their verdicts are ignored; suggest rewriting or scoping them in
+  `.painpoints/rules.json` rather than reporting them as violations.
+  The `painpoints-rules` skill covers how to rewrite, scope and test them.
 - `summary.by_role` shows where the pain lives structurally, for example
   `api-surface` handlers scoring high on `boundary_leak` means business rules
   sit in route handlers.
@@ -80,9 +94,10 @@ friends without calling the model.
 ## After you change a file
 
 Run `painpoints <file> --json` (or `painpoints_file`) again. Report the
-before and after scores for the dimensions you touched. A drop below 2.0 on
-the dimension you targeted is the success criterion; a rise elsewhere is a
-regression to mention.
+before and after scores for the dimensions you touched. The `bad:` finding you
+fixed leaving `findings`, or a drop below 2.0 on the dimension you targeted,
+is the success criterion; a new finding or a rise elsewhere is a regression to
+mention.
 
 ## Do not
 

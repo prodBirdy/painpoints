@@ -1,7 +1,7 @@
-use crate::jev::{level_of, model, Record, DIMENSIONS, PAIN_THRESHOLD};
 use crate::report::{self, Report};
 use crate::run;
 use crate::scan::Config;
+use crate::systemone::{level_of, model, Record, DIMENSIONS, PAIN_THRESHOLD};
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
@@ -30,6 +30,27 @@ pub fn findings(record: &Record) -> Vec<Value> {
             })
         })
         .collect();
+    for decision in &record.decisions {
+        if decision.band != "act" {
+            continue;
+        }
+        let dimension = DIMENSIONS.iter().find(|d| d.key == decision.dimension);
+        let score = decision.probability * 3.0;
+        found.push(json!({
+            "dimension": format!("bad:{}", decision.id),
+            "label": decision.label,
+            "score": round2_value(score),
+            "level": level_of(score),
+            "description": crate::decisions::detector(&decision.id).map(|d| d.question).unwrap_or_default(),
+            "source": dimension.map(|d| d.source).unwrap_or_default(),
+            "url": dimension.map(|d| d.url).unwrap_or_default(),
+            "kind": "decision",
+            "probability": round2_value(decision.probability),
+            "band": decision.band,
+            "lines": decision.lines,
+            "confirmed_by": decision.confirmed_by,
+        }));
+    }
     for verdict in &record.rule_verdicts {
         if verdict.band != "act" {
             continue;
@@ -46,6 +67,7 @@ pub fn findings(record: &Record) -> Vec<Value> {
             "ruleId": verdict.rule_id,
             "probability": verdict.probability,
             "band": verdict.band,
+            "lines": verdict.lines,
         }));
     }
     found.sort_by(|a, b| {
@@ -68,9 +90,11 @@ pub fn file_result(record: &Record, cached: bool) -> Value {
         "worst_score": round2_value(record.worst_score),
         "total_score": round2_value(record.total_score),
         "needs_review": record.needs_review,
-        "is_pain_point": record.worst_score >= PAIN_THRESHOLD || record.has_rule_violation(),
+        "is_pain_point": record.is_pain_point(),
         "pain_threshold": PAIN_THRESHOLD,
         "findings": findings(record),
+        "decisions": record.decisions,
+        "rule_verdicts": record.rule_verdicts,
         "cached": cached,
         "model": model(),
     })
@@ -91,7 +115,10 @@ fn classify_file(args: &Value) -> Result<Value> {
     let config = Config::single(file);
     let root = config.root.clone();
     let dir = out_dir(&root);
-    let refresh = args.get("refresh").and_then(Value::as_bool).unwrap_or(false);
+    let refresh = args
+        .get("refresh")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let cache = if refresh {
         Default::default()
     } else {
@@ -134,7 +161,10 @@ fn classify_repo(args: &Value) -> Result<Value> {
     config.limit = args.get("limit").and_then(Value::as_u64).unwrap_or(0) as usize;
 
     let dir = out_dir(&root);
-    let refresh = args.get("refresh").and_then(Value::as_bool).unwrap_or(false);
+    let refresh = args
+        .get("refresh")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let cache = if refresh {
         Default::default()
     } else {
@@ -181,7 +211,7 @@ fn tools() -> Value {
         {
             "name": "painpoints_file",
             "title": "Classify one file",
-            "description": "Score a single source file on six architectural pain dimensions and, when .painpoints/rules.json has matching model rules, on those project agent rules. Returns every score, the worst dimension, and findings: architecture dimensions at 2.0 or above plus rule:<id> violations. Reuses the saved report as a cache, so an unchanged file costs no tokens.",
+            "description": "Score a single source file on six architectural pain dimensions, check it for ten concrete bad decisions (query in a loop, swallowed error, raw error shown to a user, missing ownership check, injection and more), and, when .painpoints/rules.json has matching model rules, check those project agent rules. Returns every score, the worst dimension, and findings: dimensions at 2.0 or above, bad:<id> decisions with the lines they were found in, and rule:<id> violations. Reuses the saved report as a cache, so an unchanged file costs no tokens.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -200,7 +230,7 @@ fn tools() -> Value {
         {
             "name": "painpoints_repo",
             "title": "Classify a repository",
-            "description": "Score every source file in a repository on the six architecture dimensions and any matching agent-rule model questions from .painpoints/rules.json. Returns the distribution plus the worst files, each with its findings. Writes the full JSON and Markdown report next to the repository. Only files whose contents changed cost tokens.",
+            "description": "Score every source file in a repository on the six architecture dimensions, ten concrete bad decisions and any matching agent-rule model questions from .painpoints/rules.json. Returns the distribution plus the worst files, each with its findings. Writes the full JSON and Markdown report next to the repository. Only files whose contents changed cost tokens.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -241,7 +271,10 @@ fn failed(id: Value, code: i32, message: String) -> Value {
 
 fn call(id: Value, params: &Value) -> Value {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-    let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let args = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     let outcome = match name {
         "painpoints_file" => classify_file(&args),
         "painpoints_repo" => classify_repo(&args),
@@ -314,7 +347,7 @@ pub fn serve() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jev::Scores;
+    use crate::systemone::Scores;
 
     fn record() -> Record {
         Record {
@@ -335,6 +368,7 @@ mod tests {
             total_score: 7.0,
             needs_review: false,
             digest: "abc".into(),
+            decisions: Vec::new(),
             rule_verdicts: Vec::new(),
         }
     }
@@ -354,6 +388,7 @@ mod tests {
             band: "act".into(),
             score: 2.58,
             answer: None,
+            lines: None,
         }];
         record
     }
@@ -384,7 +419,10 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0]["dimension"], "rule:no-raw-error");
         assert_eq!(found[0]["kind"], "rule");
-        assert!(found[0]["description"].as_str().unwrap().contains("raw error"));
+        assert!(found[0]["description"]
+            .as_str()
+            .unwrap()
+            .contains("raw error"));
         assert_eq!(found[0]["source"], "AGENTS.md:4");
         assert_eq!(found[0]["url"], "");
         let value = file_result(&record_with_rule(), false);

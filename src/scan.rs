@@ -1,5 +1,5 @@
-use crate::jev::{digest, Client, FileState, Record, Usage};
 use crate::rules::{self, RulesFile};
+use crate::systemone::{digest, Client, FileState, Record, Usage};
 use anyhow::Result;
 use futures::stream::{FuturesUnordered, StreamExt};
 use ignore::WalkBuilder;
@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub const MAX_CHARS: usize = 8000;
+pub const MAX_WINDOWS: usize = 6;
+const OVERLAP_LINES: usize = 20;
 pub const CONCURRENCY: usize = 12;
 const MAX_FILE_BYTES: u64 = 400_000;
 
@@ -194,24 +196,60 @@ fn walk_builder(dir: &Path, repo_root: &Path) -> WalkBuilder {
     builder
 }
 
-pub fn read_state(root: &Path, file: &Path) -> Result<FileState> {
+/// Reads a file as the windows the model will see: consecutive slices of
+/// whole lines up to `MAX_CHARS` each, overlapping by a few lines so a
+/// construct cut at a boundary is still seen whole once, and at most
+/// `MAX_WINDOWS` of them.
+pub fn read_windows(root: &Path, file: &Path) -> Result<Vec<FileState>> {
     let raw = std::fs::read_to_string(file)?;
     let rel = file
         .strip_prefix(root)
         .unwrap_or(file)
         .to_string_lossy()
         .replace('\\', "/");
-    let mut end = MAX_CHARS.min(raw.len());
-    while end > 0 && !raw.is_char_boundary(end) {
-        end -= 1;
+    Ok(windows_of(&rel, language(file).unwrap_or("unknown"), &raw))
+}
+
+pub fn windows_of(rel: &str, language: &str, raw: &str) -> Vec<FileState> {
+    let total = raw.lines().count();
+    let lines: Vec<&str> = raw.split_inclusive('\n').collect();
+
+    let mut windows: Vec<FileState> = Vec::new();
+    let mut start = 0usize;
+    while start < lines.len() && windows.len() < MAX_WINDOWS {
+        let mut end = start;
+        let mut size = 0usize;
+        while end < lines.len() && (end == start || size + lines[end].len() <= MAX_CHARS) {
+            size += lines[end].len();
+            end += 1;
+        }
+        let mut source = lines[start..end].concat();
+        if source.len() > MAX_CHARS {
+            let mut cut = MAX_CHARS;
+            while !source.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            source.truncate(cut);
+        }
+        windows.push(FileState {
+            path: rel.to_string(),
+            language: language.to_string(),
+            lines: total,
+            start_line: start + 1,
+            end_line: end,
+            truncated: false,
+            source,
+        });
+        if end >= lines.len() {
+            break;
+        }
+        let overlap = OVERLAP_LINES.min((end - start) / 4);
+        start = end - overlap;
     }
-    Ok(FileState {
-        lines: raw.lines().count(),
-        truncated: raw.len() > end,
-        source: raw[..end].to_string(),
-        language: language(file).unwrap_or("unknown").to_string(),
-        path: rel,
-    })
+    if let Some(last) = windows.last_mut() {
+        last.truncated = last.end_line < lines.len();
+    }
+    windows
 }
 
 #[derive(Debug, Clone)]
@@ -224,7 +262,7 @@ pub enum Event {
 
 enum Job {
     Ready(Box<Record>),
-    Classify(Box<FileState>),
+    Classify(Vec<FileState>),
     Failed(String, String),
 }
 
@@ -249,13 +287,14 @@ pub async fn run(
     let mut cached = 0usize;
     let mut queue = Vec::new();
     for file in files {
-        let job = match read_state(&config.root, &file) {
-            Ok(state) => match cache
-                .get(&state.path)
-                .filter(|record| record.digest == digest(&state, agent_rules.as_ref()))
+        let job = match read_windows(&config.root, &file) {
+            Ok(windows) if windows.is_empty() => continue,
+            Ok(windows) => match cache
+                .get(&windows[0].path)
+                .filter(|record| record.digest == digest(&windows, agent_rules.as_ref()))
             {
                 Some(record) => Job::Ready(Box::new(record.clone())),
-                None => Job::Classify(Box::new(state)),
+                None => Job::Classify(windows),
             },
             Err(err) => Job::Failed(file.to_string_lossy().to_string(), err.to_string()),
         };
@@ -267,7 +306,7 @@ pub async fn run(
             Job::Failed(path, error) => {
                 let _ = tx.send(Event::Failed { path, error });
             }
-            Job::Classify(state) => queue.push(*state),
+            Job::Classify(windows) => queue.push(windows),
         }
     }
 
@@ -285,16 +324,16 @@ pub async fn run(
     let mut pending = FuturesUnordered::new();
     let mut queue = queue.into_iter();
 
-    let spawn_next = |queue: &mut std::vec::IntoIter<FileState>,
+    let spawn_next = |queue: &mut std::vec::IntoIter<Vec<FileState>>,
                       pending: &mut FuturesUnordered<_>| {
-        if let Some(state) = queue.next() {
+        if let Some(windows) = queue.next() {
             let client = client.clone();
             let agent_rules = agent_rules.clone();
             pending.push(async move {
                 client
-                    .classify(&state, agent_rules.as_ref().as_ref())
+                    .classify(&windows, agent_rules.as_ref().as_ref())
                     .await
-                    .map_err(|err| (state.path.clone(), err.to_string()))
+                    .map_err(|err| (windows[0].path.clone(), err.to_string()))
             });
         }
     };
@@ -306,8 +345,7 @@ pub async fn run(
     while let Some(result) = pending.next().await {
         match result {
             Ok((record, usage)) => {
-                total.input_tokens += usage.input_tokens;
-                total.output_tokens += usage.output_tokens;
+                total.add(usage);
                 let _ = tx.send(Event::Done(Box::new(record)));
             }
             Err((path, error)) => {
@@ -347,8 +385,56 @@ mod tests {
         let mut config = Config::new(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
         config.includes = vec!["src".into()];
         let files = collect_files(&config);
-        assert!(files.iter().any(|f| f.ends_with("jev.rs")));
+        assert!(files.iter().any(|f| f.ends_with("systemone.rs")));
         assert!(!files.iter().any(|f| f.to_string_lossy().contains("target")));
+    }
+
+    #[test]
+    fn a_short_file_is_one_window_with_every_line() {
+        let windows = windows_of("src/a.ts", "typescript", "const a = 1;\nconst b = 2;\n");
+        assert_eq!(windows.len(), 1);
+        assert_eq!((windows[0].start_line, windows[0].end_line), (1, 2));
+        assert!(!windows[0].truncated);
+        assert_eq!(windows[0].source, "const a = 1;\nconst b = 2;\n");
+    }
+
+    #[test]
+    fn a_long_file_is_read_whole_in_overlapping_windows() {
+        let line = format!("{}\n", "x".repeat(99));
+        let raw = line.repeat(200);
+        let windows = windows_of("src/big.ts", "typescript", &raw);
+        assert!(windows.len() > 1);
+        assert_eq!(windows[0].start_line, 1);
+        assert_eq!(windows.last().unwrap().end_line, 200);
+        assert!(!windows.last().unwrap().truncated);
+        for pair in windows.windows(2) {
+            assert!(
+                pair[1].start_line <= pair[0].end_line,
+                "windows must overlap"
+            );
+            assert!(pair[1].end_line > pair[0].end_line, "windows must advance");
+        }
+        assert!(windows
+            .iter()
+            .all(|w| w.source.len() <= MAX_CHARS && w.lines == 200));
+    }
+
+    #[test]
+    fn a_file_past_the_window_budget_marks_its_last_window_truncated() {
+        let line = format!("{}\n", "y".repeat(99));
+        let raw = line.repeat(80 * (MAX_WINDOWS + 2));
+        let windows = windows_of("src/huge.ts", "typescript", &raw);
+        assert_eq!(windows.len(), MAX_WINDOWS);
+        assert!(windows.last().unwrap().truncated);
+        assert!(windows[..MAX_WINDOWS - 1].iter().all(|w| !w.truncated));
+    }
+
+    #[test]
+    fn a_single_line_longer_than_a_window_is_cut_on_a_char_boundary() {
+        let raw = "é".repeat(MAX_CHARS);
+        let windows = windows_of("src/min.js", "javascript", &raw);
+        assert_eq!(windows.len(), 1);
+        assert!(windows[0].source.len() <= MAX_CHARS);
     }
 
     fn scan_fixture(name: &str) -> PathBuf {

@@ -1,4 +1,4 @@
-use crate::jev::{model, Record, Usage, DIMENSIONS, PAIN_THRESHOLD};
+use crate::systemone::{model, provider_label, Record, Usage, DIMENSIONS, PAIN_THRESHOLD};
 use anyhow::Result;
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
@@ -51,8 +51,10 @@ pub fn merge_write(
     for record in fresh {
         kept.insert(record.path.clone(), record.clone());
     }
+    let mut records: Vec<Record> = kept.into_values().collect();
+    crate::systemone::mark_noisy_rules(&mut records);
     let report = Report {
-        records: kept.into_values().collect(),
+        records,
         failures: Vec::new(),
         usage,
         root: root.to_path_buf(),
@@ -68,10 +70,7 @@ impl Report {
     }
 
     fn pain_points(&self) -> usize {
-        self.records
-            .iter()
-            .filter(|r| r.worst_score >= PAIN_THRESHOLD || r.has_rule_violation())
-            .count()
+        self.records.iter().filter(|r| r.is_pain_point()).count()
     }
 
     fn tally<'a>(&'a self, key: impl Fn(&'a Record) -> &'a str) -> BTreeMap<&'a str, usize> {
@@ -94,6 +93,23 @@ impl Report {
                 (d.key, hits)
             })
             .collect();
+        let mut by_decision = BTreeMap::new();
+        for record in &self.records {
+            for decision in &record.decisions {
+                if decision.band == "act" {
+                    *by_decision.entry(decision.id.as_str()).or_insert(0) += 1;
+                }
+            }
+        }
+        let mut noisy_rules: Vec<&str> = self
+            .records
+            .iter()
+            .flat_map(|r| r.rule_verdicts.iter())
+            .filter(|v| v.band == "noisy")
+            .map(|v| v.rule_id.as_str())
+            .collect();
+        noisy_rules.sort_unstable();
+        noisy_rules.dedup();
         let mut by_rule = BTreeMap::new();
         for record in &self.records {
             for verdict in &record.rule_verdicts {
@@ -108,7 +124,9 @@ impl Report {
             "pain_points": self.pain_points(),
             "needs_review": self.records.iter().filter(|r| r.needs_review).count(),
             "by_dimension": by_dimension,
+            "by_decision": by_decision,
             "by_rule": by_rule,
+            "noisy_rules": noisy_rules,
             "by_role": self.tally(|r| r.role.as_str()),
             "usage": self.usage,
         })
@@ -135,23 +153,60 @@ impl Report {
         let _ = writeln!(out, "# Architecture pain points\n");
         let _ = writeln!(
             out,
-            "`{}` classified {} files under `{}` with TypeSafe {}.\n",
+            "`{}` classified {} files under `{}` with {} {}.\n",
             env!("CARGO_PKG_NAME"),
             self.records.len(),
             self.root.to_string_lossy(),
+            provider_label(),
             model()
         );
         let _ = writeln!(
             out,
             "Every file is scored 0 (healthy) to 3 (painful) on six dimensions. \
              A file counts as a pain point in a dimension at {PAIN_THRESHOLD:.1} or above. \
-             Files are ranked by their worst dimension first, then by how many dimensions hurt. \
-             The scores are model judgments over the first 8000 characters of each file: \
-             treat them as a reading order, not as proof.\n"
+             Each file is also checked for ten concrete bad decisions, such as a query inside a loop \
+             or an error swallowed into a default value. \
+             Files with confirmed bad decisions or rule violations rank first, then by their worst dimension. \
+             Long files are read in overlapping windows of up to {} characters, at most {} per file. \
+             Everything here is a model judgment: treat it as a reading order, not as proof.\n",
+            crate::scan::MAX_CHARS,
+            crate::scan::MAX_WINDOWS,
         );
 
+        let ranked = self.ranked();
+        let mut bad: Vec<String> = Vec::new();
+        for record in &ranked {
+            for decision in record.decisions.iter().filter(|d| d.band == "act") {
+                let lines = decision
+                    .lines
+                    .map(|[a, b]| format!(" lines {a}-{b}"))
+                    .unwrap_or_default();
+                bad.push(format!(
+                    "- `{}`{lines}: {} ({:.2})",
+                    record.path, decision.label, decision.probability
+                ));
+            }
+        }
+        if !bad.is_empty() {
+            let _ = writeln!(out, "## Bad decisions\n");
+            for line in bad.iter().take(TOP_FILES) {
+                let _ = writeln!(out, "{line}");
+            }
+            if bad.len() > TOP_FILES {
+                let _ = writeln!(
+                    out,
+                    "- and {} more in the JSON report",
+                    bad.len() - TOP_FILES
+                );
+            }
+            let _ = writeln!(out);
+        }
+
         let _ = writeln!(out, "## Dimensions\n");
-        let _ = writeln!(out, "| dimension | files at {PAIN_THRESHOLD:.1} or above | standard |");
+        let _ = writeln!(
+            out,
+            "| dimension | files at {PAIN_THRESHOLD:.1} or above | standard |"
+        );
         let _ = writeln!(out, "| --- | --- | --- |");
         for dimension in DIMENSIONS {
             let hits = self
@@ -166,7 +221,6 @@ impl Report {
             );
         }
 
-        let ranked = self.ranked();
         let _ = writeln!(out, "\n## Worst {TOP_FILES} files\n");
         let columns: Vec<&str> = DIMENSIONS.iter().map(|d| d.short).collect();
         let _ = writeln!(
@@ -174,11 +228,7 @@ impl Report {
             "| file | role | worst | score | {} |",
             columns.join(" | ")
         );
-        let _ = writeln!(
-            out,
-            "|{}|",
-            " --- |".repeat(4 + columns.len())
-        );
+        let _ = writeln!(out, "|{}", " --- |".repeat(4 + columns.len()));
         for record in ranked.iter().take(TOP_FILES) {
             let s = &record.scores;
             let _ = writeln!(
@@ -222,7 +272,11 @@ impl Report {
                 );
             }
             if hits.len() > PER_DIMENSION {
-                let _ = writeln!(out, "- and {} more in the JSON report", hits.len() - PER_DIMENSION);
+                let _ = writeln!(
+                    out,
+                    "- and {} more in the JSON report",
+                    hits.len() - PER_DIMENSION
+                );
             }
         }
 
@@ -246,7 +300,25 @@ impl Report {
                 "These files break a model rule compiled from the repository's own instruction files into `.painpoints/rules.json`.\n"
             );
             for (path, rule, probability, source) in rule_hits.iter().take(PER_DIMENSION) {
-                let _ = writeln!(out, "- `{path}` `{rule}` ({probability:.2}) from `{source}`");
+                let _ = writeln!(
+                    out,
+                    "- `{path}` `{rule}` ({probability:.2}) from `{source}`"
+                );
+            }
+        }
+
+        let summary = self.summary();
+        if let Some(noisy) = summary["noisy_rules"].as_array().filter(|n| !n.is_empty()) {
+            let _ = writeln!(out, "\n## Noisy rules\n");
+            let _ = writeln!(
+                out,
+                "These rules came back as broken on half or more of the files they were asked about, \
+                 which usually means the question does not fit those files. Their verdicts are left out \
+                 of the findings above. Rewrite the question or give the rule a `scope` in \
+                 `.painpoints/rules.json`.\n"
+            );
+            for id in noisy.iter().filter_map(|v| v.as_str()) {
+                let _ = writeln!(out, "- `{id}`");
             }
         }
 
@@ -285,7 +357,7 @@ impl Report {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jev::Scores;
+    use crate::systemone::Scores;
 
     fn record(path: &str, worst: &str, values: [f32; 6]) -> Record {
         Record {
@@ -306,6 +378,7 @@ mod tests {
             total_score: values.iter().sum(),
             needs_review: false,
             digest: "cafe".into(),
+            decisions: Vec::new(),
             rule_verdicts: Vec::new(),
         }
     }
@@ -365,6 +438,7 @@ mod tests {
             band: "act".into(),
             score: 2.7,
             answer: None,
+            lines: None,
         }];
         let markdown = report.markdown();
         assert!(markdown.contains("Agent rule violations"));
